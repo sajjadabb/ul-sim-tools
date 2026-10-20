@@ -336,6 +336,24 @@ check("DELETE through a secure channel can still ask for its Le",
       == "80E400000A4F08A00000000900010200")
 check("DELETE with related objects sets P2 to 80 - the cascade, not a different command",
       bytearray(m.build_delete_apdu(m.unhex("A000000009"), True))[3] == 0x80)
+# Inside a packet the card manager runs the script under T=0 rules: a command
+# that produced data answers 61 xx and hands nothing over until a GET RESPONSE
+# asks. The live card answered 6159 and 6160 - 89 and 96 bytes of registry.
+check("61 xx and 6C xx are read as 'data is waiting', not as refusals",
+      m.has_pending_data(0x6159) and m.has_pending_data(0x6160)
+      and m.has_pending_data(0x6C59))
+check("a real status word is not mistaken for pending data",
+      not m.has_pending_data(0x9000) and not m.has_pending_data(0x6F00)
+      and not m.has_pending_data(0x6310) and not m.has_pending_data(0x6A88))
+check("GET RESPONSE is 00 C0 00 00 Le",
+      m.hexs(m.build_get_response_apdu(0x59)) == "00C0000059")
+check("GET RESPONSE refuses a length no APDU can carry",
+      raises(lambda: m.build_get_response_apdu(256)))
+check("a command script is its APDUs end to end, nothing added",
+      m.command_script(m.build_get_status_apdu(m.STATUS_APPLICATIONS),
+                       m.build_get_response_apdu(0x59))
+      == m.unhex("80F24000024F00" "00C0000059"))
+
 check("DELETE refuses an AID too short to be one",
       raises(lambda: m.build_delete_apdu(m.unhex("A0000000"))))
 

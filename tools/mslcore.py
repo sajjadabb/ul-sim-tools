@@ -651,6 +651,45 @@ def build_delete_apdu(aid, with_related_objects=False, with_le=False):
     return apdu + b"\x00" if with_le else apdu
 
 
+def build_get_response_apdu(length):
+    """
+    GET RESPONSE, for the command script that needs one.
+
+    Inside a secured packet the card manager runs the script under T=0 rules: a
+    command that produced data answers 61 xx -- "xx bytes are waiting" -- and
+    hands nothing over until a GET RESPONSE asks for it. There is no transport
+    layer underneath to do that automatically the way there is on a contact
+    channel, so the script carries it as the next command.
+
+    Confirmed live on the MCI/Hamrah card: GET STATUS without Le answered 6159
+    (89 bytes of registry waiting) where the same command with an Le byte
+    answered 6F00. The 61 xx was never a refusal -- it was the card asking to
+    be read.
+    """
+    if not 0 <= length <= 0xFF:
+        raise ValueError("GET RESPONSE takes 0 to 255 bytes, not %r" % (length,))
+    return bytes(bytearray([0x00, 0xC0, 0x00, 0x00, length]))
+
+
+def command_script(*apdus):
+    """
+    APDUs as one command script.
+
+    A RAM command script is simply case 3 APDUs end to end; the card walks it
+    and reports how many it executed plus the LAST one's status and data. That
+    last-one rule is what makes the GET RESPONSE pairing work.
+    """
+    out = b""
+    for apdu in apdus:
+        out += bytes(apdu)
+    return out
+
+
+def has_pending_data(status_word):
+    """True when a status word is a card asking to be read: 61 xx or 6C xx."""
+    return (status_word & 0xFF00) in (0x6100, 0x6C00)
+
+
 def parse_ram_response(response_data):
     """
     The additional response data of a RAM packet, TS 102 226 clause 5.2, compact

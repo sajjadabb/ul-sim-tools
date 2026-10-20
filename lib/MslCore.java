@@ -1117,6 +1117,48 @@ public final class MslCore
         return hexByte(status >> 8) + hexByte(status);
     }
 
+    /**
+     * GET RESPONSE, for the command script that needs one.
+     *
+     * Inside a secured packet the card manager runs the script under T=0
+     * rules: a command that produced data answers 61 xx - "xx bytes are
+     * waiting" - and the data is only handed over to a GET RESPONSE. There is
+     * no transport layer underneath to do that automatically the way there is
+     * on a contact channel, so the script has to carry it as the next command.
+     *
+     * Confirmed live on the MCI/Hamrah card: GET STATUS without Le answered
+     * 6159 (89 bytes of registry waiting) where the same command with an Le
+     * byte answered 6F00. The 61 xx was never a refusal - it was the card
+     * asking to be read.
+     */
+    public static byte[] buildGetResponseApdu(int length)
+    {
+        if (length < 0 || length > 0xFF)
+        {
+            throw new IllegalArgumentException("GET RESPONSE takes 0 to 255 bytes, not " + length);
+        }
+        return new byte[] { 0x00, (byte) 0xC0, 0x00, 0x00, (byte) length };
+    }
+
+    /**
+     * Two APDUs as one command script.
+     *
+     * A RAM command script is simply case 3 APDUs end to end; the card walks it
+     * and reports how many it executed plus the last one's status and data.
+     * That last-one rule is what makes the pairing work: the GET RESPONSE is
+     * last, so its data is what comes back.
+     */
+    public static byte[] commandScript(byte[] first, byte[] second)
+    {
+        return concat(first, second);
+    }
+
+    /** True when a status word is a card asking to be read: 61 xx or 6C xx. */
+    public static boolean hasPendingData(int status)
+    {
+        return (status & 0xFF00) == 0x6100 || (status & 0xFF00) == 0x6C00;
+    }
+
     // ------------------------------------------------------------------
     // What a RAM response packet carries
     // ------------------------------------------------------------------

@@ -760,7 +760,8 @@ def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
         apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence,
                                        m.status_form_is_tlv(chosen),
                                        m.status_form_has_le(chosen))
-        return ram_step(sender, apdu, one_higher)
+        result, ram = ram_step(sender, apdu, one_higher)
+        return read_pending_data(sender, apdu, result, ram, one_higher)
 
     result = ram = None
     for form in m.STATUS_FORMS:
@@ -772,11 +773,44 @@ def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
         # A packet the card would not take says nothing about the form.
         if result.status != 0x00 or ram is None:
             return result, ram
-        if ram["sw"] in (0x9000, 0x6310, 0x6A88):
+        # 61 xx is not a refusal: the command ran and its data is waiting.
+        if ram["sw"] in (0x9000, 0x6310, 0x6A88) or m.has_pending_data(ram["sw"]):
             sender.status_form = form
             print("  this card wants GET STATUS %s" % m.status_form_label(form))
-            return result, ram
+            return read_pending_data(sender, apdu, result, ram, one_higher)
         print("  the card answered %04X to that form%s" % (ram["sw"], extra_commands(ram)))
+    return result, ram
+
+
+def read_pending_data(sender, command, result, ram, one_higher, attempts=2):
+    """
+    Reads data the card said was waiting, by re-sending the command with a GET
+    RESPONSE after it in the same script.
+
+    Inside a secured packet there is no transport layer to do this: the card
+    manager runs the script under T=0 rules, so a command that produced data
+    answers 61 xx and hands nothing over until a GET RESPONSE asks for it.
+    Since the compact response format reports only the LAST command's data,
+    putting the GET RESPONSE last is exactly what makes the answer come back.
+
+    The command is repeated rather than the GET RESPONSE sent alone: no
+    specification promises a card keeps its pending response between two
+    secured packets, and a run that assumed it would silently read nothing.
+    One retry, for the card that answers 6C yy -- "wrong length, ask for yy".
+    """
+    for _ in range(attempts):
+        if ram is None or not m.has_pending_data(ram["sw"]):
+            return result, ram
+
+        length = ram["sw"] & 0xFF
+        print("  %04X: the card has %d byte(s) waiting, so the script is sent again with a "
+              "GET RESPONSE after the command" % (ram["sw"], length))
+        script = m.command_script(command, m.build_get_response_apdu(length))
+        result, ram = ram_step(sender, script, one_higher)
+
+        if ram is not None and ram.get("commands", 0) < 2 and result.status == 0x00:
+            print("  the card reported %d command(s) executed for a two-command script - it may "
+                  "not accept a GET RESPONSE inside one" % ram["commands"])
     return result, ram
 
 
@@ -851,18 +885,29 @@ def command_browse(args):
 
     reader, sender = open_sender(args)
     sender.tar = unhex(args.tar)
+    applications, load_files = [], []
     total = 0
     try:
         for scope in scopes:
             print()
             print("GET STATUS - %s" % m.status_scope_label(scope))
             entries, _ = ram_get_status(sender, scope, one_higher=args.allow_one_higher)
+
+            if entries:
+                print("  %-28s%-32s%s" % ("AID", "life cycle", "privileges"))
+                print("  " + "-" * 68)
             for entry in entries:
-                print("  %s" % entry.describe(scope))
+                print("  %s" % registry_line(entry, scope))
                 for module in entry.modules:
-                    print("      module %s" % hexs(module))
+                    print("      module  %s" % hexs(module))
+                if scope == m.STATUS_APPLICATIONS:
+                    applications.append(entry)
+                else:
+                    load_files.append(entry)
             print("  %d entr%s" % (len(entries), "y" if len(entries) == 1 else "ies"))
             total += len(entries)
+
+        summarise_browse(applications, load_files)
 
         print()
         print("counter: the card's last reported value was %s - start the next run above it"
@@ -871,6 +916,55 @@ def command_browse(args):
         return 0 if total else 1
     finally:
         reader.close()
+
+
+def registry_line(entry, scope):
+    life_cycle = ("not reported" if entry.life_cycle is None
+                  else "%s (%02X)" % (m.life_cycle_name(scope, entry.life_cycle),
+                                      entry.life_cycle))
+    return "%-28s%-32s%s" % (hexs(entry.aid), life_cycle,
+                             hexs(entry.privileges) if entry.privileges else "")
+
+
+def summarise_browse(applications, load_files):
+    """
+    What the card actually holds, said once at the end.
+
+    The per-scope tables are the evidence; this is the answer. The package each
+    instance came from is a GUESS and labelled as one: an instance AID usually
+    begins with its package's AID, GlobalPlatform does not require it, and
+    nothing is decided on that basis.
+    """
+    print()
+    print("=== what is on this card ===")
+    selectable = sum(1 for e in applications if e.life_cycle == 0x07)
+    modules = sum(len(e.modules) for e in load_files)
+    print("%d applet(s) and security domain(s): %d SELECTABLE, %d not selectable"
+          % (len(applications), selectable, len(applications) - selectable))
+    print("%d package(s) carrying %d module(s)" % (len(load_files), modules))
+
+    for load_file in load_files:
+        print()
+        print("package %s%s" % (hexs(load_file.aid),
+                                "" if load_file.life_cycle is None
+                                else "  (%s)" % m.life_cycle_name(m.STATUS_LOAD_FILES,
+                                                                  load_file.life_cycle)))
+        for module in load_file.modules:
+            print("    module    %s" % hexs(module))
+        for application in applications:
+            if application.aid.startswith(load_file.aid) and application.aid != load_file.aid:
+                print("    instance  %s  %s"
+                      % (hexs(application.aid),
+                         "" if application.life_cycle is None
+                         else m.life_cycle_name(m.STATUS_APPLICATIONS, application.life_cycle)))
+
+    if load_files and applications:
+        print()
+        print("Instances are matched to packages by AID prefix, which is a convention and not a")
+        print("rule. The module AID under each package is the one an INSTALL needs.")
+    print()
+    print("No MSL appears above, and none can: GET STATUS returns AIDs, life cycle and")
+    print("privileges, never install parameters. Run discover against an applet's TAR.")
 
 
 def command_delete(args):
