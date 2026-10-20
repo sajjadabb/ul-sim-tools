@@ -731,7 +731,7 @@ def ram_step(sender, apdu, one_higher=False):
     return result, getattr(sender, "last_ram", None)
 
 
-def extra_commands(ram):
+def extra_commands(ram, sent=1):
     """
     The card's own evidence that an APDU carried more than one command.
 
@@ -739,10 +739,10 @@ def extra_commands(ram):
     script carrying one means the card read trailing bytes as another command --
     which is exactly how a stray Le byte throws away the answer that mattered.
     """
-    if not ram or ram.get("commands", 1) <= 1:
+    if not ram or ram.get("commands", 1) <= sent:
         return ""
-    return (" -- and reported %d commands executed where one was sent, so it read trailing "
-            "bytes as a second command" % ram["commands"])
+    return (" -- and reported %d commands executed where %d was sent, so it read trailing "
+            "bytes as another command" % (ram["commands"], sent))
 
 
 def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
@@ -761,7 +761,7 @@ def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
                                        m.status_form_is_tlv(chosen),
                                        m.status_form_has_le(chosen))
         result, ram = ram_step(sender, apdu, one_higher)
-        return read_pending_data(sender, apdu, result, ram, one_higher)
+        return read_pending_data(sender, apdu, result, ram, one_higher, next_occurrence)
 
     result = ram = None
     for form in m.STATUS_FORMS:
@@ -777,12 +777,13 @@ def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
         if ram["sw"] in (0x9000, 0x6310, 0x6A88) or m.has_pending_data(ram["sw"]):
             sender.status_form = form
             print("  this card wants GET STATUS %s" % m.status_form_label(form))
-            return read_pending_data(sender, apdu, result, ram, one_higher)
+            return read_pending_data(sender, apdu, result, ram, one_higher, next_occurrence)
         print("  the card answered %04X to that form%s" % (ram["sw"], extra_commands(ram)))
     return result, ram
 
 
-def read_pending_data(sender, command, result, ram, one_higher, attempts=2):
+def read_pending_data(sender, command, result, ram, one_higher, continuation=False,
+                      attempts=3):
     """
     Reads data the card said was waiting, by re-sending the command with a GET
     RESPONSE after it in the same script.
@@ -799,18 +800,28 @@ def read_pending_data(sender, command, result, ram, one_higher, attempts=2):
     One retry, for the card that answers 6C yy -- "wrong length, ask for yy".
     """
     for _ in range(attempts):
-        if ram is None or not m.has_pending_data(ram["sw"]):
+        if ram is None:
+            return result, ram
+        length = m.pending_length(ram["sw"])
+        if length < 0:
             return result, ram
 
-        length = ram["sw"] & 0xFF
-        print("  %04X: the card has %d byte(s) waiting, so the script is sent again with a "
-              "GET RESPONSE after the command" % (ram["sw"], length))
-        script = m.command_script(command, m.build_get_response_apdu(length))
-        result, ram = ram_step(sender, script, one_higher)
-
-        if ram is not None and ram.get("commands", 0) < 2 and result.status == 0x00:
-            print("  the card reported %d command(s) executed for a two-command script - it may "
-                  "not accept a GET RESPONSE inside one" % ram["commands"])
+        get_response = m.build_get_response_apdu(length)
+        if continuation:
+            # A continuation must NOT be re-sent: GET STATUS with the
+            # next-occurrence bit advances the card's own cursor, so repeating
+            # it walks past the bytes it just offered. The live card proved it
+            # -- 615F, re-sent, then 6724 because that chunk was gone. It also
+            # proved the pending response survives between packets, by carrying
+            # the cursor across them.
+            print("  %04X: %d byte(s) waiting - asking for them on their own, because re-sending "
+                  "the command would advance the card's listing past them"
+                  % (ram["sw"], length))
+            result, ram = ram_step(sender, get_response, one_higher)
+        else:
+            print("  %04X: the card has %d byte(s) waiting, so the script is sent again with a "
+                  "GET RESPONSE after the command" % (ram["sw"], length))
+            result, ram = ram_step(sender, m.command_script(command, get_response), one_higher)
     return result, ram
 
 
@@ -894,8 +905,8 @@ def command_browse(args):
             entries, _ = ram_get_status(sender, scope, one_higher=args.allow_one_higher)
 
             if entries:
-                print("  %-28s%-32s%s" % ("AID", "life cycle", "privileges"))
-                print("  " + "-" * 68)
+                print("  " + column("AID", 34) + column("life cycle", 32) + "privileges")
+                print("  " + "-" * 76)
             for entry in entries:
                 print("  %s" % registry_line(entry, scope))
                 for module in entry.modules:
@@ -918,12 +929,22 @@ def command_browse(args):
         reader.close()
 
 
+def column(text, width):
+    """
+    A table cell that keeps its gap even when the value overflows.
+
+    A 16-byte AID is 32 characters, and the first live listing ran its AIDs
+    straight into the life cycle beside them.
+    """
+    return text.ljust(max(width, len(text) + 2))
+
+
 def registry_line(entry, scope):
     life_cycle = ("not reported" if entry.life_cycle is None
                   else "%s (%02X)" % (m.life_cycle_name(scope, entry.life_cycle),
                                       entry.life_cycle))
-    return "%-28s%-32s%s" % (hexs(entry.aid), life_cycle,
-                             hexs(entry.privileges) if entry.privileges else "")
+    return column(hexs(entry.aid), 34) + column(life_cycle, 32) \
+        + (hexs(entry.privileges) if entry.privileges else "")
 
 
 def summarise_browse(applications, load_files):

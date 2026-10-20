@@ -1265,6 +1265,33 @@ final class MslCore
         return (status & 0xFF00) == 0x6100 || (status & 0xFF00) == 0x6C00;
     }
 
+    /**
+     * How many bytes the card is offering, or -1 when it is offering none.
+     *
+     * Three status words say "there is data and you asked for the wrong amount
+     * of it", and all three carry the right number in the low byte:
+     *
+     *   61 xx   xx bytes are waiting (T=0's normal "come and get it")
+     *   6C xx   wrong length, use xx
+     *   67 xx   wrong length - and this card puts the right one in xx too
+     *
+     * 67 00 is a plain "wrong length" with nothing to go on, so it is not a
+     * length to retry with; neither is 6C 00. Both read as -1 here rather than
+     * as an invitation to ask for zero bytes.
+     *
+     * The MCI/Hamrah card answered 6724 to a GET RESPONSE for 0x5F bytes: not
+     * a refusal, but "the chunk you are asking about is 36 bytes now".
+     */
+    public static int pendingLength(int status)
+    {
+        int high = status & 0xFF00;
+        int low = status & 0xFF;
+
+        if (high == 0x6100) { return low; }
+        if ((high == 0x6C00 || high == 0x6700) && low != 0) { return low; }
+        return -1;
+    }
+
     // ------------------------------------------------------------------
     // What a RAM response packet carries
     // ------------------------------------------------------------------
@@ -6278,6 +6305,17 @@ public class MslScript extends SCP02Script
 
     private void recordBrowse(int found)
     {
+        if (found > 0 && browseIncomplete)
+        {
+            record(MslReport.UNCONFIRMED,
+                   found + " registry entr" + (found == 1 ? "y" : "ies")
+                   + " listed, but the listing is incomplete",
+                   "Read-only: nothing on the card was changed. One or more scopes stopped "
+                   + "answering part way through, so the card holds entries this run could not "
+                   + "read. Do not treat the list above as everything that is on the card.");
+            return;
+        }
+
         record(found > 0 ? MslReport.PASS : MslReport.UNKNOWN,
                found > 0 ? found + " registry entr" + (found == 1 ? "y" : "ies") + " listed"
                          : "no registry entries were listed",
@@ -6322,7 +6360,7 @@ public class MslScript extends SCP02Script
         {
             byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
                 MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm));
-            return readPendingData(sender, apdu, sender.exchange(apdu));
+            return readPendingData(sender, apdu, sender.exchange(apdu), next);
         }
 
         Ram answer = null;
@@ -6347,10 +6385,10 @@ public class MslScript extends SCP02Script
                 // and its data is waiting to be read. The form is good.
                 statusForm = form;
                 out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
-                return readPendingData(sender, apdu, answer);
+                return readPendingData(sender, apdu, answer, next);
             }
             out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
-                     + extraCommands(answer));
+                     + extraCommands(answer, 1));
         }
         return answer;
     }
@@ -6372,27 +6410,39 @@ public class MslScript extends SCP02Script
      *
      * One retry, for the card that answers 6C yy - "wrong length, ask for yy".
      */
-    private Ram readPendingData(Sender sender, byte[] command, Ram answer)
+    private Ram readPendingData(Sender sender, byte[] command, Ram answer, boolean continuation)
     {
-        for (int attempt = 0; attempt < 2; attempt++)
+        for (int attempt = 0; attempt < 3; attempt++)
         {
             if (answer == null || answer.inner == null) { return answer; }
 
             int status = answer.inner.statusWord;
-            if (!MslCore.hasPendingData(status)) { return answer; }
+            int length = MslCore.pendingLength(status);
+            if (length < 0) { return answer; }
 
-            int length = status & 0xFF;
-            out.info(MslCore.hexWord(status) + ": the card has " + length + " byte(s) waiting, "
-                     + "so the script is sent again with a GET RESPONSE after the command");
+            byte[] getResponse = MslCore.buildGetResponseApdu(length);
 
-            byte[] script = MslCore.commandScript(command,
-                                                  MslCore.buildGetResponseApdu(length));
-            answer = sender.exchange(script);
-
-            if (answer.inner != null && answer.inner.commands < 2 && answer.packetAccepted())
+            if (continuation)
             {
-                out.warn("the card reported " + answer.inner.commands + " command(s) executed for "
-                         + "a two-command script - it may not accept a GET RESPONSE inside one");
+                // A continuation must NOT be re-sent. GET STATUS with the
+                // next-occurrence bit advances the card's own cursor, so
+                // repeating it walks past the very bytes it just offered - the
+                // live card proved it: 615F (95 bytes waiting), re-sent, then
+                // 6724 (wrong length, 36) because the listing had moved on and
+                // that chunk was gone. The card keeps its pending response
+                // between packets, which the same run also proved by carrying
+                // the cursor across them, so the GET RESPONSE goes on its own.
+                out.info(MslCore.hexWord(status) + ": " + length + " byte(s) waiting - asking "
+                         + "for them on their own, because re-sending the command would advance "
+                         + "the card's listing past them");
+                answer = sender.exchange(getResponse);
+            }
+            else
+            {
+                out.info(MslCore.hexWord(status) + ": the card has " + length + " byte(s) "
+                         + "waiting, so the script is sent again with a GET RESPONSE after the "
+                         + "command");
+                answer = sender.exchange(MslCore.commandScript(command, getResponse));
             }
         }
         return answer;
@@ -6406,12 +6456,14 @@ public class MslScript extends SCP02Script
      * another command - which is exactly how a stray Le byte throws away the
      * answer to the command that mattered.
      */
-    private String extraCommands(Ram answer)
+    private String extraCommands(Ram answer, int sent)
     {
-        if (answer == null || answer.inner == null || answer.inner.commands <= 1) { return ""; }
-
-        return " - and reported " + answer.inner.commands + " commands executed where one was "
-            + "sent, so it read trailing bytes as a second command";
+        if (answer == null || answer.inner == null || answer.inner.commands <= sent)
+        {
+            return "";
+        }
+        return " - and reported " + answer.inner.commands + " commands executed where " + sent
+            + " was sent, so it read trailing bytes as another command";
     }
 
     private int listOverRam(Sender sender, int scope)
@@ -6449,10 +6501,22 @@ public class MslScript extends SCP02Script
             if (status != 0x9000 && status != 0x6310)
             {
                 out.error("the card manager answered " + MslCore.hexWord(status)
-                          + " to GET STATUS" + extraCommands(answer));
-                out.info("Every GET STATUS form this tool knows was refused. The key set reaches "
-                         + "the card manager - the packet was accepted - so this is the card "
-                         + "refusing card content management to it, not a transport problem.");
+                          + " to GET STATUS" + extraCommands(answer, next ? 1 : 2));
+                if (statusForm < 0)
+                {
+                    out.info("Every GET STATUS form this tool knows was refused. The key set "
+                             + "reaches the card manager - the packet was accepted - so this is "
+                             + "the card refusing card content management to it, not a transport "
+                             + "problem.");
+                }
+                else
+                {
+                    out.warn("The listing for this scope is INCOMPLETE: " + total + " entr"
+                             + (total == 1 ? "y was" : "ies were") + " read before the card "
+                             + "stopped answering. What is above is real; what is missing is "
+                             + "unknown.");
+                    browseIncomplete = true;
+                }
                 return total;
             }
 
@@ -6560,6 +6624,16 @@ public class MslScript extends SCP02Script
         return entries.size();
     }
 
+    /**
+     * True when a scope stopped answering part way through.
+     *
+     * A listing that is missing entries nobody can name is not a PASS: the
+     * verdict says so, because an operator who deletes or installs on the
+     * strength of an incomplete listing is working from a card that has more
+     * on it than the report shows.
+     */
+    private boolean browseIncomplete;
+
     /** Every application entry this run read, and every load file, for the summary. */
     private final List browsedApplications = new ArrayList();
     private final List browsedLoadFiles = new ArrayList();
@@ -6592,8 +6666,8 @@ public class MslScript extends SCP02Script
             return 0;
         }
 
-        out.info(pad("AID", 28) + pad("life cycle", 32) + "privileges");
-        out.info(pad("", 28 + 32 + 10).replace(' ', '-'));
+        out.info(column("AID", 34) + column("life cycle", 32) + "privileges");
+        out.info(pad("", 34 + 32 + 10).replace(' ', '-'));
 
         for (int i = 0; i < entries.size(); i++)
         {
@@ -6627,7 +6701,7 @@ public class MslScript extends SCP02Script
             : MslCore.lifeCycleName(scope, entry.lifeCycle)
               + " (" + MslCore.hexByte(entry.lifeCycle) + ")";
 
-        return pad(MslCore.hex(entry.aid), 28) + pad(lifeCycle, 32)
+        return column(MslCore.hex(entry.aid), 34) + column(lifeCycle, 32)
             + (entry.privileges.length == 0 ? "" : MslCore.hex(entry.privileges));
     }
 
@@ -6923,6 +6997,18 @@ public class MslScript extends SCP02Script
         StringBuilder out = new StringBuilder(text);
         while (out.length() < width) { out.append(' '); }
         return out.toString();
+    }
+
+    /**
+     * A table cell that keeps its gap even when the value overflows the column.
+     *
+     * A 16-byte AID is 32 characters, and the first live listing ran its AIDs
+     * straight into the life cycle beside them. Two spaces always, however wide
+     * the value.
+     */
+    private static String column(String text, int width)
+    {
+        return pad(text, Math.max(width, text.length() + 2));
     }
 
 
