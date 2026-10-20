@@ -3,7 +3,7 @@
 # no dongle. Run this before you need any of them.
 #
 # Expected: Java 409, Python 416, UI 38, capload 22 (26 with the operator's real
-# CAP present), RAM end-to-end 95. The Python counts assume pycryptodomex:
+# CAP present), RAM end-to-end 96. The Python counts assume pycryptodomex:
 # without it the packet builder checks and the whole end-to-end suite are
 # skipped, and each prints a smaller number and says so.
 set -u
