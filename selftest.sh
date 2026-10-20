@@ -13,6 +13,17 @@ cd "$here" || exit 2
 
 status=0
 
+echo "=== The single-file UL bundle is in step with lib/ and scripts/ ==="
+# The UL editor compiles one .java at a time, so ul/MslScript.java carries
+# every class in one file. It is generated: a bundle that has drifted from the
+# sources would compile into a card session nobody could explain.
+if command -v python >/dev/null 2>&1; then
+  python tools/bundle_ul.py --check || status=1
+elif command -v python3 >/dev/null 2>&1; then
+  python3 tools/bundle_ul.py --check || status=1
+fi
+
+echo
 echo "=== Java (lib/, used by the UL scripts) ==="
 # The SDK jar is on the RUN classpath as well as the compile one: UlChoices
 # drives the dropdowns from the SDK's own enums, and the self-test checks those

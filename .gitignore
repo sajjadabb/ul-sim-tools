@@ -8,6 +8,7 @@ app/*.exe
 __pycache__/
 *.pyc
 tools/_syn.cap
+tools/_syn_ram.cap
 
 # generated, card-specific run outputs (regenerable; may contain card details)
 reports/
