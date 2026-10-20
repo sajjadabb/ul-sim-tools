@@ -384,6 +384,72 @@ check("an empty registry response is no entries, not an error",
 
 
 # ---------------------------------------------------------------------------
+# Real wire bytes, end to end
+#
+# Whole response packets, parsed the way a run parses them. Not hand-written:
+# captured off the simulated card in selftest_ram.py, which answers secured
+# packets at the reader interface. selftest/MslSelfTest.java asserts the same
+# five vectors, so both halves of the tool are shown to read the same bytes the
+# same way - and the Java half has no other end-to-end test available to it,
+# since it needs the UL SDK jar to run at all.
+# ---------------------------------------------------------------------------
+
+def ram_chain(vector, scope):
+    """response packet -> PoR -> the RAM response in it -> the registry in that."""
+    import msl_tool as tool
+    por = tool.parse_por(m.unhex(vector))
+    ram = m.parse_ram_response(por["additional"]) if por else None
+    entries = m.parse_registry(ram["data"], scope) if ram else []
+    return por, ram, entries
+
+
+_APPS_FIRST = "02710000170A00000000030000000000016310061122334455000300"
+_APPS_NEXT = "027100001D0A000000000300000000000190000CA0000000871002FF49FF05890700"
+_ELF_SCOPE = "027100001E0A0000000003000000000001900005112233445501000106112233445500"
+_DELETE_OK = "027100000E0A00000000030000000000019000"
+_DELETE_6A88 = "027100000E0A00000000030000000000016A88"
+
+_por, _ram, _entries = ram_chain(_APPS_FIRST, m.STATUS_APPLICATIONS)
+check("a captured response packet parses", _por is not None)
+check("the PoR status says the packet was accepted", _por and _por["status"] == 0x00)
+check("the counter the card echoed is read from the right offset",
+      _por and _por["counter"] == "0003000000", _por and _por["counter"])
+check("the command inside an accepted packet answered 6310 - there is more to come",
+      _ram is not None and _ram["sw"] == 0x6310)
+check("the truncated first listing still yields its one complete entry",
+      len(_entries) == 1, str(len(_entries)))
+check("that entry is the instance, INSTALLED but not selectable",
+      len(_entries) == 1 and m.hexs(_entries[0].aid) == "112233445500"
+      and _entries[0].life_cycle == 0x03)
+
+_por, _ram, _entries = ram_chain(_APPS_NEXT, m.STATUS_APPLICATIONS)
+check("the continuation answered 9000 - the listing is complete",
+      _ram is not None and _ram["sw"] == 0x9000)
+check("the continuation carries the entry the first listing left out",
+      len(_entries) == 1 and m.hexs(_entries[0].aid) == "A0000000871002FF49FF0589",
+      str(len(_entries)))
+check("that entry is SELECTABLE", _entries and _entries[0].life_cycle == 0x07)
+
+_por, _ram, _entries = ram_chain(_ELF_SCOPE, m.STATUS_LOAD_FILES_AND_MODULES)
+check("the load file scope yields the package", len(_entries) == 1, str(len(_entries)))
+check("the package AID and its LOADED life cycle are read",
+      _entries and m.hexs(_entries[0].aid) == "1122334455"
+      and _entries[0].life_cycle == 0x01)
+check("the module inside the package is read - the AID an INSTALL needs",
+      _entries and len(_entries[0].modules) == 1
+      and m.hexs(_entries[0].modules[0]) == "112233445500")
+
+# A DELETE that worked and one for an AID the card does not have arrive inside
+# the same accepted packet; only the inner word tells them apart.
+_por, _ram, _ = ram_chain(_DELETE_OK, m.STATUS_APPLICATIONS)
+check("a DELETE that worked: PoR 00 and card SW 9000",
+      _por["status"] == 0x00 and _ram["sw"] == 0x9000 and _ram["data"] == b"")
+_por, _ram, _ = ram_chain(_DELETE_6A88, m.STATUS_APPLICATIONS)
+check("a DELETE for an AID the card lacks: the same PoR 00, card SW 6A88",
+      _por["status"] == 0x00 and _ram["sw"] == 0x6A88)
+
+
+# ---------------------------------------------------------------------------
 # The packet builder in msl_tool.py
 #
 # These are structural checks, not crypto vectors: there is no authoritative

@@ -158,7 +158,7 @@ install parameters, which is the part that needs reviewing before that run.
 
 ```bash
 pip install pyscard pycryptodomex
-python tools/selftest_msl.py                     # 383 checks, no card needed
+python tools/selftest_msl.py                     # 397 checks, no card needed
 python tools/msl_tool.py params --msl 12 --grant-tar B00010
 python tools/msl_tool.py discover --tar B00010 --kvn 01 --key <hex> --counter 1218
 
@@ -267,10 +267,14 @@ tools/      normal mode - runs on any PC/SC reader, no UL licence
                     browse, delete
   capload.py        CAP -> load file -> INSTALL [for load] + the LOAD chain
   msl_ui.py         the desktop app's backend, over ui/index.html (pywebview)
-  selftest_msl.py   383 card-free checks, including the packet builder's
+  selftest_msl.py   397 card-free checks, including the packet builder's
                     length arithmetic (CPL, CHL, PCNTR padding)
   selftest_ui.py    38 card-free checks over the app's own rules
   selftest_capload.py  the CAP serialization, reassembled and re-checked
+  selftest_ram.py   68 end-to-end checks: browse, delete and ota-install run
+                    against a simulated card that unwraps the secured packets
+                    and answers like a card manager - pyscard is the only thing
+                    replaced
 app/        MSL Checker.exe, built from msl_ui.py with PyInstaller
 lib/        shared by the UL scripts
   MslCore.java      Java port of mslcore.py's first half
@@ -285,7 +289,7 @@ lib/        shared by the UL scripts
 scripts/
   MslScript.java    all six jobs, on SCP02Script - the job is a dropdown
 selftest/
-  MslSelfTest.java  376 card-free checks: the Python ones, plus the profile's
+  MslSelfTest.java  390 card-free checks: the Python ones, plus the profile's
                     refusal to load key material, every MslConfig gate, the CAP
                     serialization, and the SDK enums against this tool's own
                     integers

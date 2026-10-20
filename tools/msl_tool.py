@@ -683,10 +683,21 @@ def command_ota_install(args):
             if result.status != 0x00:
                 print("STOPPED at %s: PoR status %02X" % (name, result.status))
                 return 1
-            # the inner SW of the executed GP command, from the compact PoR
+            # The inner SW of the executed GP command, from the compact PoR.
+            # PoR 00 only says the PACKET was accepted - MAC, counter and TAR
+            # all good - and says nothing about what the card manager did with
+            # the command inside it. Without that status word there is nothing
+            # to support a claim that the step worked, so the run stops instead
+            # of loading on top of it. (MslScript does the same, for the same
+            # reason.)
             last_sw = getattr(sender, "last_inner_sw", None)
-            print("  %-42s PoR 00%s" % (name, "" if last_sw is None else ", card SW %s" % last_sw))
-            if last_sw is not None and last_sw != "9000":
+            if last_sw is None:
+                print("  %-42s PoR 00" % name)
+                print("STOPPED at %s: the response carried no status word for the command inside "
+                      "it, so this run cannot show the command itself worked." % name)
+                return 1
+            print("  %-42s PoR 00, card SW %s" % (name, last_sw))
+            if last_sw != "9000":
                 print("STOPPED: the card manager answered %s to %s" % (last_sw, name))
                 return 1
         print()
@@ -743,11 +754,14 @@ def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
             print("  PoR 00 with no response data: this key set reaches the card manager but it "
                   "executed nothing this tool can read")
             return entries, False
+        if ram["sw"] == 0x6A88:
+            # An empty section, not a failure: the scope WAS read and the card
+            # has nothing in it. Reporting this as unreadable would send the
+            # delete job looking for a problem that is not there.
+            print("  6A88: the card has nothing in this scope - an empty section, not an error")
+            return entries, True
         if ram["sw"] not in (0x9000, 0x6310):
             print("  the card manager answered %04X to GET STATUS" % ram["sw"])
-            if ram["sw"] == 0x6A88:
-                print("  6A88 here means the card has nothing in this scope - an empty section, "
-                      "not an error")
             return entries, False
 
         entries += m.parse_registry(ram["data"], scope)

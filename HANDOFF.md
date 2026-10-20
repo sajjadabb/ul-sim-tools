@@ -55,13 +55,15 @@ lib/        shared by the UL scripts (compiled against the SDK)
 scripts/
   MslScript.java      ONE script, all six jobs; job chosen in the dialog
 selftest/
-  MslSelfTest.java    376 card-free Java checks
+  MslSelfTest.java    390 card-free Java checks
 tools/        normal mode (Python + pyscard), no UL licence
   mslcore.py          Python twin of MslCore + MslProbing (ports of each other)
   msl_tool.py         CLI: packet build, envelope, PoR parse, the jobs, ota-install
   capload.py          CAP -> GP Load File -> INSTALL[for load] + LOAD blocks + INSTALL[for install]
   msl_ui.py + ui/index.html  the HTML desktop app (pywebview); selftest_ui.py
-  selftest_msl.py (383)  selftest_capload.py (26)
+  selftest_msl.py (397)  selftest_capload.py (26)
+  selftest_ram.py (68)   end-to-end: browse/delete/ota-install against a simulated
+                         card that unwraps the packets and answers like a card manager
 app/        MSL Checker.exe (PyInstaller build of msl_ui.py)
 docs/       UL-TEST-GUIDE-FA.md, USER_MANUAL_FA.html
 reports/    generated run reports
@@ -70,7 +72,7 @@ reports/    generated run reports
 ### Build / deploy / test
 ```bash
 # full offline gate (run after EVERY edit; the operator's CLAUDE.md requires it)
-./selftest.sh          # Java 376, Python 383, UI 38, capload 26 — all must pass
+./selftest.sh          # Java 390, Python 397, UI 38, capload 26, RAM 68 — all must pass
 
 # compile + deploy to the UL folder so UL picks up changes
 OUT="C:/Users/user/OneDrive/Documents/TAR/Clases" ./build.sh lib/*.java scripts/*.java
@@ -152,15 +154,16 @@ loaded class for the whole session; re-running a script does NOT reload it.
 
 | Thing | Status |
 |---|---|
-| Offline gate (819 checks) | ✅ all green |
+| Offline gate (915 checks) | ✅ all green |
 | Python engine on live card (discover, 5 applets = MSL 12) | ✅ live |
 | UL `MslScript` discover on live card (USIM B00011 = MSL 12, PASS) | ✅ live (after the 61xx fix) |
 | silent-drop + KIc/KID split | ✅ live + tested |
 | ota-install packet construction (dry run, real CAP) | ✅ built + 26 tests |
 | Card manager reachable over OTA with the key (GET STATUS) | ✅ live PoR 00 |
 | **ota-install actually sending (irreversible)** | ❌ NOT run — awaiting operator go |
-| ota-install / browse / delete ported to UL (Java) | ✅ built + 90 new offline checks; ❌ never compiled against the real SDK jar, never run in UL |
+| ota-install / browse / delete ported to UL (Java) | ✅ built + 104 new offline checks; ❌ never compiled against the real SDK jar, never run in UL |
 | Java CAP loader vs Python capload.py (same CAP, 3 block sizes) | ✅ byte-identical (differential harness) |
+| browse / delete / ota-install end-to-end (Python, simulated card) | ✅ 68 checks: the real CLI, packet builder, envelope, 61xx reader and PoR parser against a card that verifies the load file SHA-1 itself |
 | **ISD/SCP02 install** | ❌ never live-tested (no SCP02 keys entered yet) |
 | Ciphered (0x16) sweep to prove the ciphering axis | ❌ not run (cipher axis still "untested") |
 

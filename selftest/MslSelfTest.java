@@ -33,6 +33,7 @@ public final class MslSelfTest
         configGates();
         capLoadChecks();
         cardContentChecks();
+        wireVectorChecks();
         contentManagementGates();
         ceilingAndKeyHeader();
         certificateLineCarriesNoSecrets();
@@ -1010,6 +1011,96 @@ public final class MslSelfTest
         check("an empty registry response is no entries, not an error",
               MslCore.parseRegistry(new byte[0], MslCore.STATUS_APPLICATIONS).isEmpty()
               && MslCore.parseRegistry(null, MslCore.STATUS_APPLICATIONS).isEmpty());
+    }
+
+    // ------------------------------------------------------------------
+    // Real wire bytes, end to end
+    // ------------------------------------------------------------------
+
+    /**
+     * Whole response packets, parsed the way a run parses them.
+     *
+     * These are not hand-written: they were captured off the simulated card in
+     * tools/selftest_ram.py, which answers secured packets at the reader
+     * interface and puts its PoR behind 61xx the way this card family does.
+     * tools/selftest_msl.py asserts the same five vectors, so both halves of the
+     * tool are shown to read the same bytes the same way - which is the closest
+     * thing to an end-to-end test the Java side can have without the SDK jar and
+     * a card.
+     *
+     * The chain under test is the one a RAM job actually walks: response packet
+     * -> PoR status -> the RAM response inside it -> the registry inside that.
+     */
+    private static void wireVectorChecks()
+    {
+        // GET STATUS for applications, first occurrence: the card had more than
+        // it sent, so 6310 with one entry.
+        MslCore.Por por = MslCore.parsePor(
+            MslCore.unhex("02710000170A00000000030000000000016310061122334455000300"));
+        check("a captured response packet parses", por != null);
+        check("the PoR status says the packet was accepted", por != null && por.status == 0x00);
+        check("the counter the card echoed is read from the right offset",
+              por != null && MslCore.hex(por.counter).equals("0003000000"),
+              por == null ? "" : MslCore.hex(por.counter));
+
+        MslCore.RamResponse ram = MslCore.parseRamResponse(por.responseData);
+        check("the command inside an accepted packet answered 6310 - there is more to come",
+              ram != null && ram.statusWord == 0x6310 && !ram.ok(),
+              ram == null ? "none" : MslCore.hexWord(ram.statusWord));
+
+        List entries = MslCore.parseRegistry(ram.data, MslCore.STATUS_APPLICATIONS);
+        check("the truncated first listing still yields its one complete entry",
+              entries.size() == 1, String.valueOf(entries.size()));
+        check("that entry is the instance, INSTALLED but not selectable",
+              entries.size() == 1
+              && MslCore.hex(((MslCore.Registry) entries.get(0)).aid).equals("112233445500")
+              && ((MslCore.Registry) entries.get(0)).lifeCycle == 0x03);
+
+        // The continuation, asked for with P2 bit b1: 9000 and the rest.
+        por = MslCore.parsePor(MslCore.unhex(
+            "027100001D0A000000000300000000000190000CA0000000871002FF49FF05890700"));
+        ram = MslCore.parseRamResponse(por.responseData);
+        check("the continuation answered 9000 - the listing is complete",
+              ram != null && ram.ok());
+        entries = MslCore.parseRegistry(ram.data, MslCore.STATUS_APPLICATIONS);
+        check("the continuation carries the entry the first listing left out",
+              entries.size() == 1
+              && MslCore.hex(((MslCore.Registry) entries.get(0)).aid)
+                         .equals("A0000000871002FF49FF0589"),
+              String.valueOf(entries.size()));
+        check("that entry is SELECTABLE",
+              entries.size() == 1
+              && ((MslCore.Registry) entries.get(0)).lifeCycle == 0x07);
+
+        // The load file scope, where each entry carries its modules.
+        por = MslCore.parsePor(MslCore.unhex(
+            "027100001E0A0000000003000000000001900005112233445501000106112233445500"));
+        ram = MslCore.parseRamResponse(por.responseData);
+        entries = MslCore.parseRegistry(ram.data, MslCore.STATUS_LOAD_FILES_AND_MODULES);
+        check("the load file scope yields the package", entries.size() == 1,
+              String.valueOf(entries.size()));
+        if (entries.size() == 1)
+        {
+            MslCore.Registry entry = (MslCore.Registry) entries.get(0);
+            check("the package AID and its LOADED life cycle are read",
+                  MslCore.hex(entry.aid).equals("1122334455") && entry.lifeCycle == 0x01);
+            check("the module inside the package is read - the AID an INSTALL needs",
+                  entry.modules.size() == 1
+                  && MslCore.hex((byte[]) entry.modules.get(0)).equals("112233445500"));
+        }
+
+        // A DELETE that worked, and one for an AID the card does not have. Both
+        // arrive inside an accepted packet, and only the inner word tells them
+        // apart - which is the whole reason both are checked.
+        por = MslCore.parsePor(MslCore.unhex("027100000E0A00000000030000000000019000"));
+        ram = MslCore.parseRamResponse(por.responseData);
+        check("a DELETE that worked: PoR 00 and card SW 9000",
+              por.status == 0x00 && ram != null && ram.ok() && ram.data.length == 0);
+
+        por = MslCore.parsePor(MslCore.unhex("027100000E0A00000000030000000000016A88"));
+        ram = MslCore.parseRamResponse(por.responseData);
+        check("a DELETE for an AID the card lacks: the same PoR 00, card SW 6A88",
+              por.status == 0x00 && ram != null && ram.statusWord == 0x6A88 && !ram.ok());
     }
 
     // ------------------------------------------------------------------
