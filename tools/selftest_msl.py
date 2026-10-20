@@ -345,6 +345,19 @@ check("61 xx and 6C xx are read as 'data is waiting', not as refusals",
 check("a real status word is not mistaken for pending data",
       not m.has_pending_data(0x9000) and not m.has_pending_data(0x6F00)
       and not m.has_pending_data(0x6310) and not m.has_pending_data(0x6A88))
+# 61 xx, 6C xx and 67 xx all carry the right length in the low byte. The live
+# card answered 6724 to a GET RESPONSE for 0x5F bytes - "that chunk is 36 bytes
+# now" - after its listing had moved on.
+check("61 xx offers its length", m.pending_length(0x6159) == 0x59)
+check("6C xx corrects the length", m.pending_length(0x6C24) == 0x24)
+check("67 xx corrects it too - this card's way of saying it",
+      m.pending_length(0x6724) == 0x24)
+check("a length of zero is nothing to retry with",
+      m.pending_length(0x6700) == -1 and m.pending_length(0x6C00) == -1)
+check("a real status word offers no length",
+      m.pending_length(0x9000) == -1 and m.pending_length(0x6310) == -1
+      and m.pending_length(0x6A88) == -1)
+
 check("GET RESPONSE is 00 C0 00 00 Le",
       m.hexs(m.build_get_response_apdu(0x59)) == "00C0000059")
 check("GET RESPONSE refuses a length no APDU can carry",

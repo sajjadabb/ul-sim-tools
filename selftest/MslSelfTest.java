@@ -951,6 +951,19 @@ public final class MslSelfTest
         check("a real status word is not mistaken for pending data",
               !MslCore.hasPendingData(0x9000) && !MslCore.hasPendingData(0x6F00)
               && !MslCore.hasPendingData(0x6310) && !MslCore.hasPendingData(0x6A88));
+        // 61 xx, 6C xx and 67 xx all carry the right length in the low byte.
+        // The live card answered 6724 to a GET RESPONSE for 0x5F bytes -
+        // "that chunk is 36 bytes now" - after its listing had moved on.
+        check("61 xx offers its length", MslCore.pendingLength(0x6159) == 0x59);
+        check("6C xx corrects the length", MslCore.pendingLength(0x6C24) == 0x24);
+        check("67 xx corrects it too - this card's way of saying it",
+              MslCore.pendingLength(0x6724) == 0x24);
+        check("a length of zero is nothing to retry with",
+              MslCore.pendingLength(0x6700) == -1 && MslCore.pendingLength(0x6C00) == -1);
+        check("a real status word offers no length",
+              MslCore.pendingLength(0x9000) == -1 && MslCore.pendingLength(0x6310) == -1
+              && MslCore.pendingLength(0x6A88) == -1);
+
         check("GET RESPONSE is 00 C0 00 00 Le",
               MslCore.hex(MslCore.buildGetResponseApdu(0x59)).equals("00C0000059"));
         check("GET RESPONSE refuses a length no APDU can carry",

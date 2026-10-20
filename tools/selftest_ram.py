@@ -75,7 +75,7 @@ class SimulatedCard(object):
 
     def __init__(self, applications=None, load_files=None, counter=0,
                  por_status=0x00, drop_everything=False, omit_additional_data=False,
-                 pending_style=True):
+                 pending_style=True, length_error=0x67):
         # AID -> life cycle. The registry the card reports and the delete job
         # checks against.
         self.applications = dict(applications or {})
@@ -89,7 +89,9 @@ class SimulatedCard(object):
         # it, the way the live card does. False: hand it over with the command's
         # own status word, which other cards do and the tool must also handle.
         self.pending_style = pending_style
+        self.length_error = length_error
         self._pending_response = None
+        self._cursor = {}
 
         self.envelopes = 0
         self.commands = []            # every APDU the card executed, in order
@@ -319,9 +321,10 @@ class SimulatedCard(object):
         chunk, final = self._pending_response
         requested = data[4]
         if requested != len(chunk):
-            # T=0's "wrong length, ask for this many" - a card that answers
-            # this instead of truncating is why the reader retries once.
-            return 0x6C00 | (len(chunk) & 0xFF), b""
+            # "Wrong length, ask for this many." The live card says it with
+            # 67 xx; T=0's own form is 6C xx. Both carry the right length and
+            # both must be followed.
+            return (self.length_error << 8) | (len(chunk) & 0xFF), b""
 
         self._pending_response = None
         return final, chunk
@@ -347,16 +350,27 @@ class SimulatedCard(object):
         if not registry:
             return 0x6A88, b""
 
-        # Split the first listing in two when there is more than one entry, so
-        # the 6310 continuation is exercised rather than assumed.
+        # One entry per chunk, so continuations are exercised rather than
+        # assumed - and the cursor behaves the way the live card's does: P2=00
+        # restarts the listing, P2=01 ADVANCES it. That is what makes
+        # re-sending a continuation lose a chunk, which is the bug this models.
         entries = m.parse_registry_compact(registry, scope)
-        if len(entries) > 1 and not next_occurrence:
-            first = registry[:self._first_entry_length(registry, scope)]
-            self._remainder = registry[len(first):]
-            return 0x6310, first
-        if next_occurrence:
-            return 0x9000, getattr(self, "_remainder", b"")
-        return 0x9000, registry
+        chunks = []
+        rest = registry
+        while rest:
+            length = self._first_entry_length(rest, scope)
+            chunks.append(rest[:length])
+            rest = rest[length:]
+
+        if not next_occurrence:
+            self._cursor[scope] = 0
+        index = self._cursor.get(scope, 0)
+        if index >= len(chunks):
+            return 0x6A88, b""
+
+        self._cursor[scope] = index + 1
+        more = (index + 1) < len(chunks)
+        return (0x6310 if more else 0x9000), chunks[index]
 
     def _first_entry_length(self, registry, scope):
         data = bytearray(registry)
@@ -597,6 +611,14 @@ check("the summary links the instance to the package it came from",
 check("and says plainly that no MSL can come out of GET STATUS",
       "No MSL appears above" in out, out)
 check("browse follows the card's 6310 continuation", "6310" in out, out)
+check("a continuation asks for its bytes alone, so no chunk is walked past",
+      "asking for them on their own" in out, out)
+check("every entry across the continuations is listed, not just the first chunk",
+      hexs(USIM) in out and hexs(INSTANCE) in out, out)
+check("a 16-byte AID still leaves a gap before the life cycle beside it",
+      all("SELECTABLE" not in line or line.index("SELECTABLE") >= 2
+          and line[line.index("SELECTABLE") - 1] == " "
+          for line in out.split("\n")), out)
 check("browse addressed the card manager TAR", card.last_tar == b"\x00\x00\x00",
       hexs(card.last_tar or b""))
 check("browse sent TERMINAL PROFILE first", card.terminal_profiles == [b"\x02"],
@@ -701,12 +723,14 @@ class UnderstatesLength(SimulatedCard):
         return status, response
 
 
-card = UnderstatesLength(applications={bytes(USIM): 0x07})
-code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
-                       "--no-packages"])
-check("a 6C yy - wrong length, ask for yy - is retried once and read", code == 0, out)
-check("the listing survives the correction", hexs(USIM) in out, out)
-check("and the retry is reported rather than silent", "6C" in out, out)
+for code_name, error in (("6C", 0x6C), ("67", 0x67)):
+    card = UnderstatesLength(applications={bytes(USIM): 0x07}, length_error=error)
+    code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
+                           "--no-packages"])
+    check("a %s yy - wrong length, ask for yy - is retried and read" % code_name,
+          code == 0, out)
+    check("the listing survives the %s correction" % code_name, hexs(USIM) in out, out)
+    check("and the %s retry is reported rather than silent" % code_name, code_name in out, out)
 
 card = SimulatedCard(applications={bytes(USIM): 0x07}, load_files={bytes(ELF): 0x01})
 code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",

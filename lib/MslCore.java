@@ -1159,6 +1159,33 @@ public final class MslCore
         return (status & 0xFF00) == 0x6100 || (status & 0xFF00) == 0x6C00;
     }
 
+    /**
+     * How many bytes the card is offering, or -1 when it is offering none.
+     *
+     * Three status words say "there is data and you asked for the wrong amount
+     * of it", and all three carry the right number in the low byte:
+     *
+     *   61 xx   xx bytes are waiting (T=0's normal "come and get it")
+     *   6C xx   wrong length, use xx
+     *   67 xx   wrong length - and this card puts the right one in xx too
+     *
+     * 67 00 is a plain "wrong length" with nothing to go on, so it is not a
+     * length to retry with; neither is 6C 00. Both read as -1 here rather than
+     * as an invitation to ask for zero bytes.
+     *
+     * The MCI/Hamrah card answered 6724 to a GET RESPONSE for 0x5F bytes: not
+     * a refusal, but "the chunk you are asking about is 36 bytes now".
+     */
+    public static int pendingLength(int status)
+    {
+        int high = status & 0xFF00;
+        int low = status & 0xFF;
+
+        if (high == 0x6100) { return low; }
+        if ((high == 0x6C00 || high == 0x6700) && low != 0) { return low; }
+        return -1;
+    }
+
     // ------------------------------------------------------------------
     // What a RAM response packet carries
     // ------------------------------------------------------------------

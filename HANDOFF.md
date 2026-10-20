@@ -55,14 +55,14 @@ lib/        shared by the UL scripts (compiled against the SDK)
 scripts/
   MslScript.java      ONE script, all six jobs; job chosen in the dialog
 selftest/
-  MslSelfTest.java    404 card-free Java checks
+  MslSelfTest.java    409 card-free Java checks
 tools/        normal mode (Python + pyscard), no UL licence
   mslcore.py          Python twin of MslCore + MslProbing (ports of each other)
   msl_tool.py         CLI: packet build, envelope, PoR parse, the jobs, ota-install
   capload.py          CAP -> GP Load File -> INSTALL[for load] + LOAD blocks + INSTALL[for install]
   msl_ui.py + ui/index.html  the HTML desktop app (pywebview); selftest_ui.py
-  selftest_msl.py (411)  selftest_capload.py (26)
-  selftest_ram.py (89)   end-to-end: browse/delete/ota-install against a simulated
+  selftest_msl.py (416)  selftest_capload.py (26)
+  selftest_ram.py (95)   end-to-end: browse/delete/ota-install against a simulated
                          card that unwraps the packets and answers like a card manager
 app/        MSL Checker.exe (PyInstaller build of msl_ui.py)
 docs/       UL-TEST-GUIDE-FA.md, USER_MANUAL_FA.html
@@ -72,7 +72,7 @@ reports/    generated run reports
 ### Build / deploy / test
 ```bash
 # full offline gate (run after EVERY edit; the operator's CLAUDE.md requires it)
-./selftest.sh          # Java 404, Python 411, UI 38, capload 26, RAM 89 — all must pass
+./selftest.sh          # Java 409, Python 416, UI 38, capload 26, RAM 95 — all must pass
 
 # compile + deploy to the UL folder so UL picks up changes
 OUT="C:/Users/user/OneDrive/Documents/TAR/Clases" ./build.sh lib/*.java scripts/*.java
@@ -138,6 +138,13 @@ loaded class for the whole session; re-running a script does NOT reload it.
    response reports only the LAST command, that GET RESPONSE is what brings the
    registry back. `MslScript.readPendingData` re-sends the command with the
    GET RESPONSE appended, and retries once on 6C yy. **61 xx is not a refusal.**
+   And a CONTINUATION must not be re-sent: `GET STATUS` with the
+   next-occurrence bit advances the card's own cursor, so repeating it walks
+   past the chunk it just offered (live: 615F, re-sent, then **6724** — "that
+   chunk is 36 bytes now", the 95 bytes gone). The same run proved the pending
+   response survives between packets, because the cursor did, so a continuation
+   sends the GET RESPONSE on its own. `67 xx` carries the right length like
+   `6C xx` does.
 
 ---
 
@@ -174,13 +181,13 @@ loaded class for the whole session; re-running a script does NOT reload it.
 
 | Thing | Status |
 |---|---|
-| Offline gate (964 checks) | ✅ all green |
+| Offline gate (980 checks) | ✅ all green |
 | Python engine on live card (discover, 5 applets = MSL 12) | ✅ live |
 | UL `MslScript` discover on live card (USIM B00011 = MSL 12, PASS) | ✅ live (after the 61xx fix) |
 | silent-drop + KIc/KID split | ✅ live + tested |
 | ota-install packet construction (dry run, real CAP) | ✅ built + 26 tests |
 | Card manager reachable over OTA with the key (GET STATUS) | ✅ live PoR 00 — but see below: the PoR was 00 while the command itself answered 6F00, which earlier sessions did not check |
-| browse in UL on the live card (packet accepted, inner SW read) | ⚠️ 2026-10-20: transport proven end to end (TERMINAL PROFILE 9000, PoR 00, counter echoed); GET STATUS answered 6F00 because of the Le byte — fixed, not yet re-run |
+| **browse in UL on the live card** | ✅ 2026-10-20: 13 registry entries read off "saga" over RAM — 5 applets/SDs and 8 packages, with life cycles. Took three live runs to get there (see the three card behaviours above) |
 | **ota-install actually sending (irreversible)** | ❌ NOT run — awaiting operator go |
 | ota-install / browse / delete ported to UL (Java) | ✅ built + 104 new offline checks; ❌ never compiled against the real SDK jar, never run in UL |
 | Java CAP loader vs Python capload.py (same CAP, 3 block sizes) | ✅ byte-identical (differential harness) |

@@ -690,6 +690,30 @@ def has_pending_data(status_word):
     return (status_word & 0xFF00) in (0x6100, 0x6C00)
 
 
+def pending_length(status_word):
+    """
+    How many bytes the card is offering, or -1 when it is offering none.
+
+    Three status words say "there is data and you asked for the wrong amount of
+    it", and all three carry the right number in the low byte:
+
+        61 xx   xx bytes are waiting (T=0's normal "come and get it")
+        6C xx   wrong length, use xx
+        67 xx   wrong length -- and this card puts the right one in xx too
+
+    67 00 and 6C 00 carry nothing to retry with, so they read as -1 rather than
+    as an invitation to ask for zero bytes. The MCI/Hamrah card answered 6724
+    to a GET RESPONSE for 0x5F bytes: not a refusal, but "the chunk you are
+    asking about is 36 bytes now".
+    """
+    high, low = status_word & 0xFF00, status_word & 0xFF
+    if high == 0x6100:
+        return low
+    if high in (0x6C00, 0x6700) and low:
+        return low
+    return -1
+
+
 def parse_ram_response(response_data):
     """
     The additional response data of a RAM packet, TS 102 226 clause 5.2, compact
