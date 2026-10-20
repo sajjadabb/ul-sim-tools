@@ -944,4 +944,373 @@ public final class MslCore
         }
         return concat(new byte[] { (byte) value.length }, value);
     }
+
+    // ==================================================================
+    // GET STATUS and DELETE
+    //
+    // Browsing and deleting are GlobalPlatform card content management, exactly
+    // like INSTALL, and they travel the same two roads: inside an SCP02 secure
+    // channel over the contact interface, or inside a secured packet addressed
+    // to the card manager's TAR over OTA (Remote Application Management).
+    //
+    // The SDK has typed commands for the first road and MslScript uses them
+    // there. Over OTA there is no secure channel to put a typed command object
+    // in - the APDU has to exist as bytes before it can become the payload of a
+    // packet - so the two commands are built here, card-free and under test.
+    //
+    // Governing specs: GlobalPlatform Card Specification 2.2 clause 11.3
+    // (DELETE), clause 11.4 (GET STATUS) and ETSI TS 102 226 clause 5 for the
+    // RAM response the card sends back.
+    // ==================================================================
+
+    /** GET STATUS P1: which part of the registry to list. */
+    public static final int STATUS_ISSUER_SECURITY_DOMAIN = 0x80;
+    public static final int STATUS_APPLICATIONS = 0x40;          // applications and SSDs
+    public static final int STATUS_LOAD_FILES = 0x20;            // executable load files
+    public static final int STATUS_LOAD_FILES_AND_MODULES = 0x10;
+
+    public static String statusScopeLabel(int p1)
+    {
+        if (p1 == STATUS_ISSUER_SECURITY_DOMAIN)   { return "issuer security domain"; }
+        if (p1 == STATUS_APPLICATIONS)             { return "applications and security domains"; }
+        if (p1 == STATUS_LOAD_FILES)               { return "executable load files"; }
+        if (p1 == STATUS_LOAD_FILES_AND_MODULES)   { return "load files and their modules"; }
+        return "GET STATUS P1 " + hexByte(p1);
+    }
+
+    /** True when this scope's registry entries carry a module list after the privileges. */
+    public static boolean scopeCarriesModules(int p1)
+    {
+        return p1 == STATUS_LOAD_FILES_AND_MODULES;
+    }
+
+    /**
+     * GET STATUS.
+     *
+     * P2 bit b1 is "next occurrence" - the continuation after a 6310 - and bit
+     * b2 selects the response format: clear for the deprecated (compact) format
+     * every card supports, set for the GlobalPlatform 2.2 TLV format. The
+     * deprecated format is the default here for the same reason MslScript asks
+     * the SDK for it on the contact path: it is the one a 2.1.1 card answers at
+     * all.
+     *
+     * An empty AID filter means "list everything", which is what tag 4F with
+     * length 00 says. Le is present and 00: GET STATUS is a case 4 command, and
+     * over RAM the card puts its answer in the response packet rather than
+     * leaving it to a GET RESPONSE.
+     */
+    public static byte[] buildGetStatusApdu(int p1, byte[] aidFilter, boolean nextOccurrence,
+                                            boolean tlvFormat)
+    {
+        byte[] filter = (aidFilter == null) ? new byte[0] : aidFilter;
+        if (filter.length > 0x10)
+        {
+            throw new IllegalArgumentException("an AID is 5 to 16 bytes; this filter is "
+                + filter.length);
+        }
+
+        byte[] data = tlv(0x4F, filter);
+        int p2 = (nextOccurrence ? 0x01 : 0x00) | (tlvFormat ? 0x02 : 0x00);
+
+        byte[] header = { (byte) 0x80, (byte) 0xF2, (byte) p1, (byte) p2, (byte) data.length };
+        return concat(concat(header, data), new byte[] { 0x00 });
+    }
+
+    /**
+     * DELETE [card content].
+     *
+     * P2 00 deletes the object named and nothing else; P2 80 deletes it and
+     * every related object - which for an executable load file means the load
+     * file AND every applet instance made from it. That cascade is the only way
+     * to remove a package whose instances are still present (the card answers
+     * 6A80/6985 otherwise), and it is also the fastest way to delete more than
+     * was intended, so it is never the default and MslScript names every AID it
+     * is about to remove before it sends anything.
+     *
+     * There is no undo. A deleted applet instance takes its install parameters
+     * with it, and that includes the MSL this whole tool exists to measure.
+     */
+    public static byte[] buildDeleteApdu(byte[] aid, boolean withRelatedObjects)
+    {
+        if (aid == null || aid.length < 5 || aid.length > 16)
+        {
+            throw new IllegalArgumentException("an AID is 5 to 16 bytes, got "
+                + (aid == null ? "null" : String.valueOf(aid.length)));
+        }
+
+        byte[] data = tlv(0x4F, aid);
+        byte[] header = { (byte) 0x80, (byte) 0xE4, 0x00,
+                          (byte) (withRelatedObjects ? 0x80 : 0x00), (byte) data.length };
+        return concat(concat(header, data), new byte[] { 0x00 });
+    }
+
+    /** A status word as four hex digits, for log lines and notes. */
+    public static String hexWord(int status)
+    {
+        return hexByte(status >> 8) + hexByte(status);
+    }
+
+    // ------------------------------------------------------------------
+    // What a RAM response packet carries
+    // ------------------------------------------------------------------
+
+    /**
+     * The additional response data of a RAM packet, ETSI TS 102 226 clause 5.2,
+     * compact format:
+     *
+     *   number of executed C-APDUs (1) | SW1 SW2 of the last one (2) | its response data
+     *
+     * Reading the status word matters more than it looks: a PoR status of 00
+     * says the PACKET was accepted - MAC good, counter good, TAR resolved - and
+     * says nothing at all about whether the command inside it worked. An INSTALL
+     * that the card refused with 6A80 arrives inside a perfectly good PoR 00.
+     * Every RAM step in MslScript checks this status word for 9000 as well.
+     */
+    public static final class RamResponse
+    {
+        public final int commands;
+        public final int statusWord;
+        public final byte[] data;
+
+        RamResponse(int commands, int statusWord, byte[] data)
+        {
+            this.commands = commands;
+            this.statusWord = statusWord;
+            this.data = data;
+        }
+
+        public boolean ok() { return statusWord == 0x9000; }
+
+        public String describe()
+        {
+            return commands + " command(s) executed, last answered " + hexWord(statusWord)
+                + (data.length == 0 ? ", no response data"
+                                    : ", " + data.length + " byte(s) of response data");
+        }
+    }
+
+    /**
+     * Reads the compact RAM response out of a PoR's response data. Null when
+     * there is not even a status word there, which is what a PoR with no
+     * additional data looks like - legal, and the normal answer to a command
+     * that returns nothing.
+     */
+    public static RamResponse parseRamResponse(byte[] responseData)
+    {
+        if (responseData == null || responseData.length < 3) { return null; }
+
+        int commands = responseData[0] & 0xFF;
+        int status = ((responseData[1] & 0xFF) << 8) | (responseData[2] & 0xFF);
+        byte[] data = (responseData.length == 3)
+            ? new byte[0] : slice(responseData, 3, responseData.length - 3);
+        return new RamResponse(commands, status, data);
+    }
+
+    // ------------------------------------------------------------------
+    // The registry
+    // ------------------------------------------------------------------
+
+    /** One registry entry, from either GET STATUS response format. */
+    public static final class Registry
+    {
+        public byte[] aid = new byte[0];
+        public int lifeCycle = -1;
+        public byte[] privileges = new byte[0];
+        public final List modules = new ArrayList();      // byte[] each, load-file scopes only
+
+        public String describe(int scope)
+        {
+            StringBuilder text = new StringBuilder();
+            text.append(hex(aid));
+            if (lifeCycle >= 0)
+            {
+                text.append("  life cycle ").append(hexByte(lifeCycle))
+                    .append(" (").append(lifeCycleName(scope, lifeCycle)).append(")");
+            }
+            if (privileges.length > 0)
+            {
+                text.append("  privileges ").append(hex(privileges));
+            }
+            return text.toString();
+        }
+    }
+
+    /**
+     * The life cycle names GlobalPlatform 2.2 gives each scope (Tables 11-4 and
+     * 11-5). The same byte means different things for a load file, an
+     * application and the card manager, so the scope decides - and anything
+     * unrecognised is reported as application-specific rather than guessed at,
+     * because the upper bits are the applet's own to use.
+     */
+    public static String lifeCycleName(int scope, int value)
+    {
+        if (scope == STATUS_LOAD_FILES || scope == STATUS_LOAD_FILES_AND_MODULES)
+        {
+            return value == 0x01 ? "LOADED" : "application-specific";
+        }
+        if (scope == STATUS_ISSUER_SECURITY_DOMAIN)
+        {
+            if (value == 0x01) { return "OP_READY"; }
+            if (value == 0x07) { return "INITIALIZED"; }
+            if (value == 0x0F) { return "SECURED"; }
+            if (value == 0x7F) { return "CARD_LOCKED"; }
+            if (value == 0xFF) { return "TERMINATED"; }
+            return "application-specific";
+        }
+        if ((value & 0x80) != 0) { return "LOCKED"; }
+        if (value == 0x03) { return "INSTALLED"; }
+        if (value == 0x07) { return "SELECTABLE"; }
+        if (value == 0x0F) { return "PERSONALIZED (security domain)"; }
+        return "application-specific";
+    }
+
+    /**
+     * The deprecated (compact) GET STATUS response format:
+     *
+     *   AID length(1) AID  life cycle(1)  privileges(1)
+     *   [ number of modules(1)  then per module: AID length(1) AID ]
+     *
+     * The module list exists only for P1=10, which is why the scope has to be
+     * passed in: the two shapes are indistinguishable from the bytes alone, and
+     * a parser that guessed would read a module count as the next entry's AID
+     * length and hand back a registry of plausible nonsense.
+     *
+     * Tolerant on purpose at the end - a card may truncate the list and say
+     * 6310, meaning "ask again with P2 next-occurrence" - so a trailing
+     * fragment stops the walk instead of throwing. What it will not do is
+     * invent a field: an entry is added only once its AID is complete.
+     */
+    public static List parseRegistryCompact(byte[] data, int scope)
+    {
+        List out = new ArrayList();
+        if (data == null) { return out; }
+
+        int pos = 0;
+        while (pos < data.length)
+        {
+            int length = data[pos] & 0xFF;
+            if (length == 0 || pos + 1 + length > data.length) { break; }
+
+            Registry entry = new Registry();
+            entry.aid = slice(data, pos + 1, length);
+            pos += 1 + length;
+
+            if (pos < data.length) { entry.lifeCycle = data[pos] & 0xFF; pos++; }
+            if (pos < data.length) { entry.privileges = slice(data, pos, 1); pos++; }
+
+            if (scopeCarriesModules(scope) && pos < data.length)
+            {
+                int modules = data[pos] & 0xFF;
+                pos++;
+                for (int i = 0; i < modules && pos < data.length; i++)
+                {
+                    int moduleLength = data[pos] & 0xFF;
+                    if (moduleLength == 0 || pos + 1 + moduleLength > data.length) { break; }
+                    entry.modules.add(slice(data, pos + 1, moduleLength));
+                    pos += 1 + moduleLength;
+                }
+            }
+            out.add(entry);
+        }
+        return out;
+    }
+
+    /**
+     * The GlobalPlatform 2.2 TLV format: one E3 template per entry, carrying
+     * tag 4F (AID), 9F70 (life cycle), C5 (privileges) and 84 (module AID,
+     * repeated).
+     *
+     * Only offered because some cards answer in it even when the deprecated
+     * format was asked for, and reading one format as the other produces
+     * entries rather than an error.
+     */
+    public static List parseRegistryTlv(byte[] data)
+    {
+        List out = new ArrayList();
+        List templates = walkBer(data);
+
+        for (int i = 0; i < templates.size(); i++)
+        {
+            Object[] template = (Object[]) templates.get(i);
+            if (((Integer) template[0]).intValue() != 0xE3) { continue; }
+
+            Registry entry = new Registry();
+            List fields = walkBer((byte[]) template[1]);
+            for (int j = 0; j < fields.size(); j++)
+            {
+                Object[] field = (Object[]) fields.get(j);
+                int tag = ((Integer) field[0]).intValue();
+                byte[] value = (byte[]) field[1];
+
+                if (tag == 0x4F)                       { entry.aid = value; }
+                else if (tag == 0x9F70 && value.length > 0) { entry.lifeCycle = value[0] & 0xFF; }
+                else if (tag == 0xC5)                  { entry.privileges = value; }
+                else if (tag == 0x84)                  { entry.modules.add(value); }
+            }
+            if (entry.aid.length > 0) { out.add(entry); }
+        }
+        return out;
+    }
+
+    /**
+     * Whichever format the card actually used. A GET STATUS response that opens
+     * with E3 is the TLV one; anything else is read as the deprecated format,
+     * which is what was asked for.
+     */
+    public static List parseRegistry(byte[] data, int scope)
+    {
+        if (data != null && data.length > 0 && (data[0] & 0xFF) == 0xE3)
+        {
+            return parseRegistryTlv(data);
+        }
+        return parseRegistryCompact(data, scope);
+    }
+
+    /**
+     * BER-TLV walk with two-byte tags and the 81/82 length forms, which the
+     * registry format needs (tag 9F70) and the short-form walk above does not
+     * handle. Stops at the first field that overruns, like its sibling.
+     */
+    private static List walkBer(byte[] data)
+    {
+        List out = new ArrayList();
+        int pos = 0;
+
+        while (data != null && pos + 1 < data.length)
+        {
+            int tag = data[pos] & 0xFF;
+            pos++;
+            if ((tag & 0x1F) == 0x1F)                  // the tag continues into a second byte
+            {
+                if (pos >= data.length) { break; }
+                tag = (tag << 8) | (data[pos] & 0xFF);
+                pos++;
+            }
+            if (pos >= data.length) { break; }
+
+            int length = data[pos] & 0xFF;
+            pos++;
+            if (length == 0x81)
+            {
+                if (pos >= data.length) { break; }
+                length = data[pos] & 0xFF;
+                pos++;
+            }
+            else if (length == 0x82)
+            {
+                if (pos + 1 >= data.length) { break; }
+                length = ((data[pos] & 0xFF) << 8) | (data[pos + 1] & 0xFF);
+                pos += 2;
+            }
+            else if (length > 0x80)
+            {
+                break;                                 // a longer length form: not in a registry
+            }
+
+            if (pos + length > data.length) { break; }
+            out.add(new Object[] { Integer.valueOf(tag), slice(data, pos, length) });
+            pos += length;
+        }
+        return out;
+    }
 }

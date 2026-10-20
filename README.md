@@ -58,7 +58,7 @@ the one independent check available for this encoding.
 
 ---
 
-## The three jobs
+## The jobs
 
 ### 1. Install an applet with a specific MSL
 
@@ -158,9 +158,14 @@ install parameters, which is the part that needs reviewing before that run.
 
 ```bash
 pip install pyscard pycryptodomex
-python tools/selftest_msl.py                     # 286 checks, no card needed
+python tools/selftest_msl.py                     # 383 checks, no card needed
 python tools/msl_tool.py params --msl 12 --grant-tar B00010
 python tools/msl_tool.py discover --tar B00010 --kvn 01 --key <hex> --counter 1218
+
+# card content management over OTA (RAM), addressed to the card manager TAR
+python tools/msl_tool.py browse --tar 000000 --key <hex> --counter 3000000
+python tools/msl_tool.py delete --aid 112233445500 --tar 000000 --key <hex> \
+                                --counter 3000000            # dry run; --confirm to send
 ```
 
 Three preconditions for any OTA over a contact reader, two of which fail
@@ -185,6 +190,32 @@ silently:
    and counter are right, before any install is attempted.
 5. Then **install** when you need to *set* an MSL, and **verify** to prove it
    took.
+
+Three further jobs do card content management from the same script, chosen on
+the same dropdown, with their own tab (**Card content**) for the values they
+need:
+
+- **browse** — GET STATUS over either road: applet instances with their life
+  cycle state, packages with the module AIDs inside them, and the ISD's own
+  entry. Read-only, and the job to run before an install or a delete, because
+  it is the only way to learn the AIDs a card actually has. (No MSL comes out
+  of it: nothing reads install parameters back.)
+- **ota-install** — load a CAP and install from it entirely over OTA, the Java
+  side of `msl_tool.py ota-install`: INSTALL [for load], the LOAD chain and
+  INSTALL [for install], each wrapped in its own secured packet to the card
+  manager's TAR. The load file this tool builds is cross-checked against the
+  SDK's own `LoadSequence` reading of the same CAP - same AID, same SHA-1 over
+  the whole load file - and nothing is sent if they disagree.
+- **delete** — DELETE an instance or a package, with the related-objects
+  cascade when a package still has instances. The registry is read first and
+  the DELETE is refused when the card does not have that AID.
+
+**ota-install and delete are dry runs until the acknowledgement on the Run tab
+is ticked**: they build every packet, print it, and send nothing. Both check
+two status words per step, because they are different things - the PoR says the
+*packet* was accepted (MAC, counter and TAR all good), while the status word
+inside it says what the card manager did with the *command*. A refused INSTALL
+arrives inside a perfectly good PoR 00.
 
 Both scripts show a run dialog before sending anything. Cancel means nothing is
 sent — not even a reset. Credentials are typed fresh every run and are never
@@ -229,30 +260,38 @@ so both routes are offered and the bytes actually sent are always printed.
 
 ```
 tools/      normal mode - runs on any PC/SC reader, no UL licence
-  mslcore.py        the MSL logic: encoding, install parameters, inference. No I/O.
-  msl_tool.py       the CLI: packet building, envelope, PoR parsing, the three jobs
-  msl_app.py        the window - a Tkinter front end over the same two files
-app/        MSL Checker.exe, built from msl_app.py with PyInstaller
-  selftest_msl.py   286 card-free checks, including the packet builder's
+  mslcore.py        the MSL logic: encoding, install parameters, inference,
+                    GET STATUS and DELETE. No I/O.
+  msl_tool.py       the CLI: packet building, envelope, PoR parsing, and the
+                    jobs - params, install, verify, discover, ota-install,
+                    browse, delete
+  capload.py        CAP -> load file -> INSTALL [for load] + the LOAD chain
+  msl_ui.py         the desktop app's backend, over ui/index.html (pywebview)
+  selftest_msl.py   383 card-free checks, including the packet builder's
                     length arithmetic (CPL, CHL, PCNTR padding)
-  selftest_app.py   27 card-free checks over the window itself
+  selftest_ui.py    38 card-free checks over the app's own rules
+  selftest_capload.py  the CAP serialization, reassembled and re-checked
+app/        MSL Checker.exe, built from msl_ui.py with PyInstaller
 lib/        shared by the UL scripts
   MslCore.java      Java port of mslcore.py's first half
   MslProbing.java   Java port of its second half - probes, discovery, verification
+  MslCapLoad.java   Java twin of capload.py - CAP, load file, LOAD chain
   MslConfig.java    what a run needs, and what stops it from starting
   MslConfigDialog.java  the run dialog - tabs, dropdowns, live validation
   UlChoices.java    the bridge to the SDK's own enums, and the SPI it packs
   MslProfile.java   non-secret pre-fill, with key material refused
   MslLog.java       live log window plus the platform's own output panel
+  MslReport.java    the HTML and CSV report a run leaves behind
 scripts/
-  MslScript.java    all three jobs, on SCP02Script - the job is a dropdown
+  MslScript.java    all six jobs, on SCP02Script - the job is a dropdown
 selftest/
-  MslSelfTest.java  248 card-free checks: the Python ones, plus the profile's
-                    refusal to load key material, every MslConfig gate, and the
-                    SDK enums against this tool's own integers
+  MslSelfTest.java  376 card-free checks: the Python ones, plus the profile's
+                    refusal to load key material, every MslConfig gate, the CAP
+                    serialization, and the SDK enums against this tool's own
+                    integers
 config/     optional non-secret pre-fill
 build.sh    compiles outside the GUI
-selftest.sh runs both self-tests
+selftest.sh runs every self-test
 ```
 
 ### The run dialog

@@ -543,6 +543,285 @@ def build_install_apdu(load_file_aid, module_aid, instance_aid, install_paramete
 
 
 # ---------------------------------------------------------------------------
+# GET STATUS and DELETE
+# ---------------------------------------------------------------------------
+#
+# Browsing and deleting are GlobalPlatform card content management, exactly like
+# INSTALL, and they travel the same two roads: inside an SCP02 secure channel
+# over the contact interface, or inside a secured packet addressed to the card
+# manager's TAR over OTA (Remote Application Management). Over OTA the APDU has
+# to exist as bytes before it can become the payload of a packet, so both
+# commands are built here -- the twin of MslCore.buildGetStatusApdu and
+# MslCore.buildDeleteApdu, which lib/ uses for the same reason.
+#
+# Governing specs: GlobalPlatform 2.2 clause 11.3 (DELETE), clause 11.4 (GET
+# STATUS), ETSI TS 102 226 clause 5.2 for the RAM response.
+
+STATUS_ISSUER_SECURITY_DOMAIN = 0x80
+STATUS_APPLICATIONS = 0x40            # applications and supplementary security domains
+STATUS_LOAD_FILES = 0x20              # executable load files
+STATUS_LOAD_FILES_AND_MODULES = 0x10
+
+STATUS_SCOPE_LABELS = {
+    STATUS_ISSUER_SECURITY_DOMAIN: "issuer security domain",
+    STATUS_APPLICATIONS: "applications and security domains",
+    STATUS_LOAD_FILES: "executable load files",
+    STATUS_LOAD_FILES_AND_MODULES: "load files and their modules",
+}
+
+
+def status_scope_label(p1):
+    return STATUS_SCOPE_LABELS.get(p1, "GET STATUS P1 %02X" % p1)
+
+
+def scope_carries_modules(p1):
+    """True when this scope's entries carry a module list after the privileges."""
+    return p1 == STATUS_LOAD_FILES_AND_MODULES
+
+
+def build_get_status_apdu(p1, aid_filter=b"", next_occurrence=False, tlv_format=False):
+    """
+    GET STATUS.
+
+    P2 bit b1 is "next occurrence" (the continuation after a 6310) and bit b2
+    picks the response format: clear for the deprecated/compact format every
+    card answers, set for the GlobalPlatform 2.2 TLV format. An empty AID filter
+    means "list everything", which is tag 4F with length 00. Le is present and
+    00 -- GET STATUS is case 4, and over RAM the answer comes back inside the
+    response packet.
+    """
+    aid_filter = bytes(aid_filter)
+    if len(aid_filter) > 0x10:
+        raise ValueError("an AID is 5 to 16 bytes; this filter is %d" % len(aid_filter))
+    data = _tlv(0x4F, aid_filter)
+    p2 = (0x01 if next_occurrence else 0x00) | (0x02 if tlv_format else 0x00)
+    return bytes(bytearray([0x80, 0xF2, p1, p2, len(data)])) + data + b"\x00"
+
+
+def build_delete_apdu(aid, with_related_objects=False):
+    """
+    DELETE [card content].
+
+    P2 00 removes the object named and nothing else; P2 80 removes it and every
+    related object -- for an executable load file that means the load file AND
+    every applet instance made from it. The cascade is the only way to remove a
+    package whose instances are still there, and also the fastest way to delete
+    more than was intended, so it is never a default: the caller names every AID
+    it is about to remove first. There is no undo, and a deleted instance takes
+    its install parameters (the MSL this tool measures) with it.
+    """
+    aid = bytes(aid)
+    if not 5 <= len(aid) <= 16:
+        raise ValueError("an AID is 5 to 16 bytes, got %d" % len(aid))
+    data = _tlv(0x4F, aid)
+    p2 = 0x80 if with_related_objects else 0x00
+    return bytes(bytearray([0x80, 0xE4, 0x00, p2, len(data)])) + data + b"\x00"
+
+
+def parse_ram_response(response_data):
+    """
+    The additional response data of a RAM packet, TS 102 226 clause 5.2, compact
+    format:
+
+        number of executed C-APDUs(1) | SW1 SW2 of the last one(2) | its response data
+
+    Returns None when there is not even a status word there -- legal, and the
+    normal answer to a command that returns nothing. Reading this status word is
+    not optional: PoR 00 says the PACKET was accepted (MAC, counter and TAR all
+    good) and says nothing about the command inside it, so an INSTALL the card
+    refused with 6A80 arrives inside a perfectly good PoR 00.
+    """
+    if response_data is None:
+        return None
+    data = bytearray(response_data)
+    if len(data) < 3:
+        return None
+    return {
+        "commands": data[0],
+        "sw": (data[1] << 8) | data[2],
+        "data": bytes(data[3:]),
+    }
+
+
+class RegistryEntry(object):
+    """One GET STATUS registry entry, from either response format."""
+
+    def __init__(self, aid=b"", life_cycle=None, privileges=b"", modules=None):
+        self.aid = bytes(aid)
+        self.life_cycle = life_cycle
+        self.privileges = bytes(privileges)
+        self.modules = list(modules or [])
+
+    def describe(self, scope):
+        text = hexs(self.aid)
+        if self.life_cycle is not None:
+            text += "  life cycle %02X (%s)" % (self.life_cycle,
+                                                life_cycle_name(scope, self.life_cycle))
+        if self.privileges:
+            text += "  privileges %s" % hexs(self.privileges)
+        return text
+
+    def __eq__(self, other):
+        return (isinstance(other, RegistryEntry) and self.aid == other.aid
+                and self.life_cycle == other.life_cycle
+                and self.privileges == other.privileges and self.modules == other.modules)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __repr__(self):
+        return "RegistryEntry(%s)" % hexs(self.aid)
+
+
+def life_cycle_name(scope, value):
+    """
+    The life cycle names GlobalPlatform 2.2 gives each scope (Tables 11-4,
+    11-5). The same byte means different things for a load file, an application
+    and the card manager, so the scope decides -- and anything unrecognised is
+    reported as application-specific rather than guessed at, because the upper
+    bits are the applet's own to use.
+    """
+    if scope in (STATUS_LOAD_FILES, STATUS_LOAD_FILES_AND_MODULES):
+        return "LOADED" if value == 0x01 else "application-specific"
+    if scope == STATUS_ISSUER_SECURITY_DOMAIN:
+        return {0x01: "OP_READY", 0x07: "INITIALIZED", 0x0F: "SECURED",
+                0x7F: "CARD_LOCKED", 0xFF: "TERMINATED"}.get(value, "application-specific")
+    if value & 0x80:
+        return "LOCKED"
+    return {0x03: "INSTALLED", 0x07: "SELECTABLE",
+            0x0F: "PERSONALIZED (security domain)"}.get(value, "application-specific")
+
+
+def parse_registry_compact(data, scope):
+    """
+    The deprecated (compact) GET STATUS response format:
+
+        AID length(1) AID  life cycle(1)  privileges(1)
+        [ number of modules(1) then per module: AID length(1) AID ]
+
+    The module list exists only for P1=10, which is why the scope is a
+    parameter: the two shapes cannot be told apart from the bytes alone, and a
+    parser that guessed would read a module count as the next entry's AID length
+    and hand back a registry of plausible nonsense.
+
+    Tolerant at the end on purpose -- a card may truncate the list and say 6310,
+    meaning "ask again with P2 next-occurrence" -- so a trailing fragment stops
+    the walk instead of raising. What it will not do is invent a field.
+    """
+    out = []
+    if not data:
+        return out
+    data = bytearray(data)
+    pos = 0
+    while pos < len(data):
+        length = data[pos]
+        if length == 0 or pos + 1 + length > len(data):
+            break
+        entry = RegistryEntry(aid=bytes(data[pos + 1:pos + 1 + length]))
+        pos += 1 + length
+
+        if pos < len(data):
+            entry.life_cycle = data[pos]
+            pos += 1
+        if pos < len(data):
+            entry.privileges = bytes(data[pos:pos + 1])
+            pos += 1
+
+        if scope_carries_modules(scope) and pos < len(data):
+            modules = data[pos]
+            pos += 1
+            for _ in range(modules):
+                if pos >= len(data):
+                    break
+                module_length = data[pos]
+                if module_length == 0 or pos + 1 + module_length > len(data):
+                    break
+                entry.modules.append(bytes(data[pos + 1:pos + 1 + module_length]))
+                pos += 1 + module_length
+        out.append(entry)
+    return out
+
+
+def parse_registry_tlv(data):
+    """
+    The GlobalPlatform 2.2 TLV format: one E3 template per entry, carrying tag
+    4F (AID), 9F70 (life cycle), C5 (privileges) and 84 (module AID, repeated).
+
+    Here only because some cards answer in it even when the deprecated format
+    was asked for, and reading one as the other produces entries rather than an
+    error.
+    """
+    out = []
+    for tag, value in _walk_ber(data):
+        if tag != 0xE3:
+            continue
+        entry = RegistryEntry()
+        for inner_tag, inner in _walk_ber(value):
+            if inner_tag == 0x4F:
+                entry.aid = inner
+            elif inner_tag == 0x9F70 and inner:
+                entry.life_cycle = bytearray(inner)[0]
+            elif inner_tag == 0xC5:
+                entry.privileges = inner
+            elif inner_tag == 0x84:
+                entry.modules.append(inner)
+        if entry.aid:
+            out.append(entry)
+    return out
+
+
+def parse_registry(data, scope):
+    """Whichever format the card actually used: E3 first means the TLV one."""
+    if data and bytearray(data)[0] == 0xE3:
+        return parse_registry_tlv(data)
+    return parse_registry_compact(data, scope)
+
+
+def _walk_ber(data):
+    """
+    BER-TLV walk with two-byte tags and the 81/82 length forms, which the
+    registry format needs (tag 9F70) and _walk_tlv above does not handle. Stops
+    at the first field that overruns, like its sibling.
+    """
+    out = []
+    if not data:
+        return out
+    data = bytearray(data)
+    pos = 0
+    while pos + 1 < len(data):
+        tag = data[pos]
+        pos += 1
+        if tag & 0x1F == 0x1F:                      # the tag continues into a second byte
+            if pos >= len(data):
+                break
+            tag = (tag << 8) | data[pos]
+            pos += 1
+        if pos >= len(data):
+            break
+
+        length = data[pos]
+        pos += 1
+        if length == 0x81:
+            if pos >= len(data):
+                break
+            length = data[pos]
+            pos += 1
+        elif length == 0x82:
+            if pos + 1 >= len(data):
+                break
+            length = (data[pos] << 8) | data[pos + 1]
+            pos += 2
+        elif length > 0x80:
+            break                                   # a longer length form: not in a registry
+
+        if pos + length > len(data):
+            break
+        out.append((tag, bytes(data[pos:pos + length])))
+        pos += length
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Probing: what the card can be asked, and what its answers mean
 # ---------------------------------------------------------------------------
 #

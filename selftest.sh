@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Card-free checks over the MSL logic, both implementations. No reader, no card,
 # no dongle. Run this before you need any of them.
+#
+# Expected: Java 376, Python 383, UI 38, capload 22 (26 with the operator's real
+# CAP present). The Python counts assume pycryptodomex: without it the packet
+# builder checks are skipped and the suite prints a smaller number and says so.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"

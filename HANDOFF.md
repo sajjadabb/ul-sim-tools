@@ -14,7 +14,9 @@ applet loading:
 1. **discover** — find the MSL an installed applet enforces (read-only).
 2. **verify** — prove a claimed MSL is the one in force (read-only).
 3. **install** — install a toolkit applet with a chosen MSL (ISD/SCP02, irreversible).
-4. **ota-install** — load + install a CAP over OTA/RAM (Python only so far, irreversible).
+4. **ota-install** — load + install a CAP over OTA/RAM (Python AND UL/Java, irreversible).
+5. **browse** — list applets and packages over OTA or SCP02 (read-only).
+6. **delete** — remove an applet instance or a package (irreversible).
 
 **MSL is write-only from outside the card** — no command reads install
 parameters back. So the only way to know an applet's MSL is to send secured OTA
@@ -40,7 +42,9 @@ Governing specs: ETSI TS 102 221/223/225/226, 3GPP TS 23.040, GlobalPlatform 2.x
 ### Layout
 ```
 lib/        shared by the UL scripts (compiled against the SDK)
-  MslCore.java        MSL encoding, install-param TLVs (two formats), envelope + PoR, INSTALL APDU
+  MslCore.java        MSL encoding, install-param TLVs (two formats), envelope + PoR, INSTALL
+                      APDU, GET STATUS + DELETE APDUs, registry + RAM response parsing
+  MslCapLoad.java     twin of capload.py: CAP -> load file -> INSTALL[for load] + LOAD chain
   MslProbing.java     the inference: Probe/Result/Oracle/discover/verify, SimulatedCard
   MslConfig.java      what a run needs + validation gates
   MslConfigDialog.java the run dialog (JFrame, tabs, dropdowns from SDK enums)
@@ -49,15 +53,15 @@ lib/        shared by the UL scripts (compiled against the SDK)
   MslReport.java      HTML + CSV report writer
   UlChoices.java      bridge: SDK enums <-> tool integers; packs SPI via the SDK's SPI ctor
 scripts/
-  MslScript.java      ONE script, all jobs; job chosen in the dialog
+  MslScript.java      ONE script, all six jobs; job chosen in the dialog
 selftest/
-  MslSelfTest.java    286 card-free Java checks
+  MslSelfTest.java    376 card-free Java checks
 tools/        normal mode (Python + pyscard), no UL licence
   mslcore.py          Python twin of MslCore + MslProbing (ports of each other)
   msl_tool.py         CLI: packet build, envelope, PoR parse, the jobs, ota-install
   capload.py          CAP -> GP Load File -> INSTALL[for load] + LOAD blocks + INSTALL[for install]
   msl_ui.py + ui/index.html  the HTML desktop app (pywebview); selftest_ui.py
-  selftest_msl.py (357)  selftest_capload.py (26)
+  selftest_msl.py (383)  selftest_capload.py (26)
 app/        MSL Checker.exe (PyInstaller build of msl_ui.py)
 docs/       UL-TEST-GUIDE-FA.md, USER_MANUAL_FA.html
 reports/    generated run reports
@@ -66,7 +70,7 @@ reports/    generated run reports
 ### Build / deploy / test
 ```bash
 # full offline gate (run after EVERY edit; the operator's CLAUDE.md requires it)
-./selftest.sh          # Java 286, Python 357, UI 38, capload 26 — all must pass
+./selftest.sh          # Java 376, Python 383, UI 38, capload 26 — all must pass
 
 # compile + deploy to the UL folder so UL picks up changes
 OUT="C:/Users/user/OneDrive/Documents/TAR/Clases" ./build.sh lib/*.java scripts/*.java
@@ -148,13 +152,15 @@ loaded class for the whole session; re-running a script does NOT reload it.
 
 | Thing | Status |
 |---|---|
-| Offline gate (610 checks) | ✅ all green |
+| Offline gate (819 checks) | ✅ all green |
 | Python engine on live card (discover, 5 applets = MSL 12) | ✅ live |
 | UL `MslScript` discover on live card (USIM B00011 = MSL 12, PASS) | ✅ live (after the 61xx fix) |
 | silent-drop + KIc/KID split | ✅ live + tested |
 | ota-install packet construction (dry run, real CAP) | ✅ built + 26 tests |
 | Card manager reachable over OTA with the key (GET STATUS) | ✅ live PoR 00 |
 | **ota-install actually sending (irreversible)** | ❌ NOT run — awaiting operator go |
+| ota-install / browse / delete ported to UL (Java) | ✅ built + 90 new offline checks; ❌ never compiled against the real SDK jar, never run in UL |
+| Java CAP loader vs Python capload.py (same CAP, 3 block sizes) | ✅ byte-identical (differential harness) |
 | **ISD/SCP02 install** | ❌ never live-tested (no SCP02 keys entered yet) |
 | Ciphered (0x16) sweep to prove the ciphering axis | ❌ not run (cipher axis still "untested") |
 
@@ -162,26 +168,39 @@ loaded class for the whole session; re-running a script does NOT reload it.
 
 ## 6. Pending work the operator asked for
 
-1. **Port ota-install to UL/Java.** Currently ota-install is Python-only
-   (`msl_tool.py` + `capload.py`). Add it to `MslScript` so it runs in the UL GUI.
-   The safe approach: use the SDK's `LoadSequence` to get the correct LOAD APDUs
-   (don't re-serialize by hand in Java), then wrap INSTALL[for load] + each LOAD
-   APDU + INSTALL[for install] in SCP80 secured packets to the card-manager TAR
-   with the OTA key (reuse `MslScript.Sender`'s packet path and the `61xx`
-   GET RESPONSE handling). Verify the inner SW of each PoR is 9000.
-2. **Browse capability** — list applets AND packages (ELFs) on the card, over OTA
-   and/or ISD. GET STATUS: P1=0x40 (apps+SSDs), P1=0x20 (ELFs), P1=0x10
-   (ELFs+modules), each wrapped in a secured packet to the card manager (or via
-   SCP02). Parse the registry TLVs (AID, life cycle, privileges). There is prior
-   art in `TAR/OTA-AppletBrowser` (if still present) and the sim-os-atp GET STATUS
-   helpers.
-3. **Delete capability** — DELETE applet instance and DELETE package (with the
-   cascade option for an ELF that still has instances). `80 E4 00 00` (P2=00
-   object, P2=80 object+related), data `4F <len> <AID>`. IRREVERSIBLE — gate it
-   behind a dry-run + explicit confirm like ota-install.
-4. **Run the ota-install** (irreversible) on the operator's go, or on a test card.
-5. **Ciphered 0x16 sweep** (enable "Allow ciphered probes", fill KIc) to measure
+Items 1-3 below were **done** in the session of 2026-10-20 (branch
+`claude/lucid-pasteur-fe4gpm`); what is left of them is verification on the
+operator's machine, which is the first thing to do.
+
+1. ~~Port ota-install to UL/Java.~~ **Done.** `MslScript.otaInstall()` plus the
+   new `lib/MslCapLoad.java`. The LOAD chain is built in Java because over OTA
+   the block size has to be ours (~160 bytes, not the 255 a contact channel
+   allows), and the safety the handoff asked for is kept a different way: the
+   load file is cross-checked against the SDK's `LoadSequence` for the same CAP
+   — same AID, same SHA-1 over the whole block — and nothing is sent if they
+   disagree. Both the PoR status and the inner SW are checked per step.
+2. ~~Browse capability.~~ **Done.** `MslScript.browse()`, GET STATUS P1 80 / 40
+   / 10 over either road, following the card's 6310 continuations, with both
+   response formats parsed (compact and the GP 2.2 E3 TLV one).
+3. ~~Delete capability.~~ **Done.** `MslScript.deleteObject()`, P2 00 / 80,
+   dry run by default, and it refuses to send when the registry does not hold
+   the AID.
+4. **Verify the three new jobs on the operator's machine**, in this order:
+   `./build.sh lib/*.java scripts/*.java` (first real compile against the SDK
+   jar — nothing in a cloud container can do that), `./selftest.sh`, then
+   **browse** in UL, which is read-only and exercises the whole RAM path:
+   TERMINAL PROFILE, packet, PoR, inner SW, registry parse. If browse lists the
+   card, ota-install's transport is proven; only the CAP serialization and the
+   INSTALL itself remain.
+5. **Run the ota-install** (irreversible) on the operator's go, or on a test card.
+6. **Ciphered 0x16 sweep** (enable "Allow ciphered probes", fill KIc) to measure
    the ciphering axis and remove the one "untested" axis from the reports.
+7. **The HTML desktop app (`app/MSL Checker.exe`, `tools/msl_ui.py` +
+   `ui/index.html`) still offers only discover / verify / params.** The three
+   new jobs were added to the UL dialog and the Python CLI, not to it. Adding
+   browse there would be the useful one (read-only, and it is what an operator
+   reaches for first); ota-install and delete arguably belong behind the UL
+   dialog's gates rather than in a one-click app.
 
 ### ota-install: how to actually send (when authorized)
 ```bash
@@ -233,9 +252,21 @@ These memory files hold the load-bearing facts; a new agent should read them:
 
 ## 9. Immediate next step
 
-The operator's last request: **update UL (port ota-install to the Java/UL side)
-and add browse + delete of applets/packages.** Start with item 6.1 (ota-install
-in UL) and 6.2/6.3 (browse/delete), each with offline tests and a dry-run +
-confirm gate for the destructive ones. Keep the Python twin in step. Run the full
-gate after every edit and report counts. Confirm with the operator before any
-irreversible send, and prefer a disposable test card over "saga".
+That request — **update UL: port ota-install to the Java/UL side, and add browse
++ delete of applets/packages** — is implemented (section 6, items 1-3), with
+offline tests and a dry-run + confirm gate on both destructive jobs, and the
+Python twin kept in step.
+
+What is NOT done, and cannot be done away from the operator's machine: **none of
+the new Java has been compiled against the real `ul-scripttool.jar`, and none of
+it has run in UL or touched a card.** A cloud container has no SDK jar and no
+reader. The offline evidence is: 376 Java checks (the dialog and the self-test
+compile; `MslScript` was symbol-checked and introduces no SDK call that was not
+already in the file), 383 + 38 + 22 Python checks, and a differential harness
+proving the Java CAP loader and `capload.py` produce byte-identical load files,
+LOAD chains, GET STATUS/DELETE APDUs and registry parses on the same CAP.
+
+So the next step is item 6.4: build on the UL machine, run the gate, then run
+**browse** — read-only, and it exercises the entire RAM path. Confirm with the
+operator before any irreversible send, and prefer a disposable test card over
+"saga".
