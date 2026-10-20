@@ -745,132 +745,155 @@ def extra_commands(ram, sent=1):
             "bytes as another command" % (ram["commands"], sent))
 
 
-def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
+def listing_script(scope, chunk, form):
     """
-    One GET STATUS, in a form this card will actually act on.
+    The command script that re-walks a listing to chunk `chunk`.
 
-    Two things cards disagree about -- the trailing Le and the response format
-    -- and neither can be settled from a specification. So the forms are tried
-    in turn until one is accepted, and the one that worked is remembered on the
-    sender for the rest of the run. A scope that is simply empty (6A88) still
-    shows the form was understood, so it counts here.
+    GET STATUS with P2=00 restarts the listing and GET STATUS with the
+    next-occurrence bit advances it by one chunk, so the whole walk fits in one
+    packet and is idempotent: every attempt starts from the beginning. That is
+    what makes it safe. A continuation sent on its own advances the card's
+    cursor and the chunk it was offering is gone -- proven live, twice.
     """
+    tlv, le = m.status_form_is_tlv(form), m.status_form_has_le(form)
+    script = m.build_get_status_apdu(scope, b"", False, tlv, le)
+    for _ in range(chunk):
+        script += m.build_get_status_apdu(scope, b"", True, tlv, le)
+    return script
+
+
+def read_chunk(sender, script, length, one_higher):
+    """
+    Reads the chunk the walk ends on, with one correction.
+
+    6C yy and 67 yy both mean "wrong length, it is yy" and both are worth
+    following, because the walk is idempotent: asking again costs a packet and
+    nothing else. Returns (result, ram), or (None, None) when it failed.
+    """
+    for _ in range(2):
+        print("  reading %d byte(s) with a GET RESPONSE at the end of the walk" % length)
+        result, ram = ram_step(sender, m.command_script(script,
+                                                        m.build_get_response_apdu(length)),
+                               one_higher)
+        if result.status != 0x00 or ram is None:
+            return None, None
+
+        corrected = m.pending_length(ram["sw"])
+        if corrected < 0 or corrected == length:
+            return result, ram
+        print("  %04X: the card wants %d byte(s) asked for instead, so the walk is repeated "
+              "with that length" % (ram["sw"], corrected))
+        length = corrected
+    return None, None
+
+
+def first_chunk_probe(sender, scope, one_higher):
+    """The first chunk, where the GET STATUS form is still being established."""
     chosen = getattr(sender, "status_form", None)
     if chosen is not None:
-        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence,
-                                       m.status_form_is_tlv(chosen),
-                                       m.status_form_has_le(chosen))
-        result, ram = ram_step(sender, apdu, one_higher)
-        return read_pending_data(sender, apdu, result, ram, one_higher, next_occurrence)
+        return ram_step(sender, listing_script(scope, 0, chosen), one_higher)
 
     result = ram = None
     for form in m.STATUS_FORMS:
-        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence,
-                                       m.status_form_is_tlv(form), m.status_form_has_le(form))
+        apdu = m.build_get_status_apdu(scope, b"", False, m.status_form_is_tlv(form),
+                                       m.status_form_has_le(form))
         print("  trying %s: %s" % (m.status_form_label(form), hexs(apdu)))
         result, ram = ram_step(sender, apdu, one_higher)
 
-        # A packet the card would not take says nothing about the form.
         if result.status != 0x00 or ram is None:
             return result, ram
-        # 61 xx is not a refusal: the command ran and its data is waiting.
         if ram["sw"] in (0x9000, 0x6310, 0x6A88) or m.has_pending_data(ram["sw"]):
             sender.status_form = form
             print("  this card wants GET STATUS %s" % m.status_form_label(form))
-            return read_pending_data(sender, apdu, result, ram, one_higher, next_occurrence)
+            return result, ram
         print("  the card answered %04X to that form%s" % (ram["sw"], extra_commands(ram)))
     return result, ram
 
 
-def read_pending_data(sender, command, result, ram, one_higher, continuation=False,
-                      attempts=3):
+def ram_get_status(sender, scope, one_higher=False, chunks=16):
     """
-    Reads data the card said was waiting, by re-sending the command with a GET
-    RESPONSE after it in the same script.
+    GET STATUS over RAM, chunk by chunk.
 
-    Inside a secured packet there is no transport layer to do this: the card
-    manager runs the script under T=0 rules, so a command that produced data
-    answers 61 xx and hands nothing over until a GET RESPONSE asks for it.
-    Since the compact response format reports only the LAST command's data,
-    putting the GET RESPONSE last is exactly what makes the answer come back.
+    Two packets per chunk: one to ask how long it is (the card answers 61 xx),
+    one to walk to it again and read it with a GET RESPONSE at the end. The
+    second packet repeats the walk because the pending data does not survive
+    the first -- proven live, when a GET RESPONSE sent alone in the next packet
+    answered 6F00 with nothing behind it.
 
-    The command is repeated rather than the GET RESPONSE sent alone: no
-    specification promises a card keeps its pending response between two
-    secured packets, and a run that assumed it would silently read nothing.
-    One retry, for the card that answers 6C yy -- "wrong length, ask for yy".
-    """
-    for _ in range(attempts):
-        if ram is None:
-            return result, ram
-        length = m.pending_length(ram["sw"])
-        if length < 0:
-            return result, ram
-
-        get_response = m.build_get_response_apdu(length)
-        if continuation:
-            # A continuation must NOT be re-sent: GET STATUS with the
-            # next-occurrence bit advances the card's own cursor, so repeating
-            # it walks past the bytes it just offered. The live card proved it
-            # -- 615F, re-sent, then 6724 because that chunk was gone. It also
-            # proved the pending response survives between packets, by carrying
-            # the cursor across them.
-            print("  %04X: %d byte(s) waiting - asking for them on their own, because re-sending "
-                  "the command would advance the card's listing past them"
-                  % (ram["sw"], length))
-            result, ram = ram_step(sender, get_response, one_higher)
-        else:
-            print("  %04X: the card has %d byte(s) waiting, so the script is sent again with a "
-                  "GET RESPONSE after the command" % (ram["sw"], length))
-            result, ram = ram_step(sender, m.command_script(command, get_response), one_higher)
-    return result, ram
-
-
-def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
-    """
-    GET STATUS over RAM, following the card's 6310 continuations.
-
-    6310 is "there is more, ask again with P2 next-occurrence". Each round is
-    another packet and another step of the OTA counter, so the walk is bounded:
-    a card that answered 6310 forever would otherwise empty the counter space.
+    Returns (entries, complete).
     """
     entries = []
-    next_occurrence = False
 
-    for _ in range(rounds):
-        result, ram = ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher)
+    for chunk in range(chunks):
+        # The form has to be settled before the script is built: the walk and
+        # the GET RESPONSE that reads it must be the same shape, or the card
+        # answers one and refuses the other.
+        if chunk == 0:
+            result, ram = first_chunk_probe(sender, scope, one_higher)
+            script = listing_script(scope, 0, getattr(sender, "status_form", 0))
+        else:
+            script = listing_script(scope, chunk, getattr(sender, "status_form", 0))
+            if len(script) + 5 > 197:
+                print("  the walk to chunk %d no longer fits one packet; the listing stops here "
+                      "and is incomplete" % (chunk + 1))
+                return entries, False
+            print("  walking to chunk %d: %s" % (chunk + 1, hexs(script)))
+            result, ram = ram_step(sender, script, one_higher)
 
-        if result.status != 0x00:
-            print("  the packet was not accepted (PoR %s) -- nothing was read"
-                  % ("none" if result.status is None else "%02X" % result.status))
+        if result is None or result.status != 0x00:
+            print("  the packet was not accepted -- nothing was read")
             return entries, False
         if ram is None:
             print("  PoR 00 with no response data: this key set reaches the card manager but it "
                   "executed nothing this tool can read")
             return entries, False
         if ram["sw"] == 0x6A88:
-            # An empty section, not a failure: the scope WAS read and the card
-            # has nothing in it. Reporting this as unreadable would send the
-            # delete job looking for a problem that is not there.
-            print("  6A88: the card has nothing in this scope - an empty section, not an error")
+            print("  6A88: the card has nothing more in this scope - an empty section, "
+                  "not an error")
             return entries, True
+
+        length = m.pending_length(ram["sw"])
+        if length >= 0:
+            result, ram = read_chunk(sender, script, length, one_higher)
+            if ram is None:
+                return entries, False
+
         if ram["sw"] not in (0x9000, 0x6310):
             print("  the card manager answered %04X to GET STATUS%s"
-                  % (ram["sw"], extra_commands(ram)))
-            print("  Every GET STATUS form this tool knows was refused. The packet WAS accepted, "
-                  "so the key set reaches the card manager - this is the card refusing card "
-                  "content management to it, not a transport problem.")
+                  % (ram["sw"], extra_commands(ram, chunk + 2)))
             return entries, False
 
         entries += m.parse_registry(ram["data"], scope)
         if ram["sw"] != 0x6310:
             return entries, True
+        print("  6310: the card has more entries in this scope, walking to the next chunk")
 
-        print("  6310: more entries in this scope, asking for the next ones")
-        next_occurrence = True
+    return entries, False
 
-    print("  stopped after %d continuations - the card kept saying 6310, so this listing is "
-          "incomplete" % rounds)
-    return entries, True
+
+def ram_get_status_for(sender, scope, aid, one_higher=False):
+    """
+    One GET STATUS filtered to a single AID, read in full.
+
+    A filtered listing is one entry, so it never chunks. The pair is still
+    required: the card holds its answer behind 61 xx and loses it when the
+    packet ends.
+    """
+    form = getattr(sender, "status_form", 0)
+    apdu = m.build_get_status_apdu(scope, aid, False, m.status_form_is_tlv(form),
+                                   m.status_form_has_le(form))
+    result, ram = ram_step(sender, apdu, one_higher)
+    if result.status != 0x00 or ram is None:
+        return [], False
+
+    length = m.pending_length(ram["sw"])
+    if length >= 0:
+        result, ram = read_chunk(sender, apdu, length, one_higher)
+        if ram is None:
+            return [], False
+    if ram["sw"] not in (0x9000, 0x6310):
+        return [], ram["sw"] == 0x6A88
+    return m.parse_registry(ram["data"], scope), True
 
 
 def command_browse(args):
@@ -1020,8 +1043,8 @@ def command_delete(args):
         print("what is at that AID now:")
         found = []
         for scope in (m.STATUS_APPLICATIONS, m.STATUS_LOAD_FILES_AND_MODULES):
-            entries, read = ram_get_status(sender, scope, aid,
-                                           one_higher=args.allow_one_higher)
+            entries, read = ram_get_status_for(sender, scope, aid,
+                                               one_higher=args.allow_one_higher)
             for entry in entries:
                 if entry.aid == aid:
                     print("  %s" % entry.describe(scope))

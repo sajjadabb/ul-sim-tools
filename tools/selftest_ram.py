@@ -195,6 +195,14 @@ class SimulatedCard(object):
         return self._response_packet(tar, commands, status_word, response)
 
     def _command_script(self, script):
+        # The pending response does NOT survive the packet: the live card
+        # answered 6F00 to a GET RESPONSE sent alone in the next one. The
+        # cursor DOES survive, which is why a continuation must never be
+        # re-sent on its own.
+        self._pending_response = None
+        return self._walk_script(script)
+
+    def _walk_script(self, script):
         """
         The secured data of a RAM packet is a COMMAND SCRIPT: a sequence of
         case 3 APDUs, each CLA INS P1 P2 Lc DATA. The card walks it, executes
@@ -611,8 +619,10 @@ check("the summary links the instance to the package it came from",
 check("and says plainly that no MSL can come out of GET STATUS",
       "No MSL appears above" in out, out)
 check("browse follows the card's 6310 continuation", "6310" in out, out)
-check("a continuation asks for its bytes alone, so no chunk is walked past",
-      "asking for them on their own" in out, out)
+check("a later chunk is reached by walking the listing again from the start",
+      "walking to chunk 2" in out, out)
+check("the walk is what reads it, not a continuation sent on its own",
+      "GET RESPONSE at the end of the walk" in out, out)
 check("every entry across the continuations is listed, not just the first chunk",
       hexs(USIM) in out and hexs(INSTANCE) in out, out)
 check("a 16-byte AID still leaves a gap before the life cycle beside it",

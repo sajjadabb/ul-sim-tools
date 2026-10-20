@@ -902,117 +902,32 @@ public class MslScript extends SCP02Script
      */
     /**
      * The GET STATUS form this card accepts. -1 until one has answered, then
-     * reused for every later scope and continuation in the run.
+     * reused for every later scope and chunk in the run.
      */
     private int statusForm = -1;
 
     /**
-     * GET STATUS over RAM, in a form this card will actually act on.
+     * One GET STATUS filtered to a single AID, read in full.
      *
-     * Two things cards disagree about - the trailing Le and the response
-     * format - and neither can be settled from a specification. The MCI/Hamrah
-     * card answered 6F00 to the form every other card here accepts, and said
-     * why in its own response: two commands executed where one was sent. It had
-     * read the Le byte as the start of a second command, and the compact
-     * response format reports only the last command's status, so the GET STATUS
-     * answer was discarded.
-     *
-     * So the forms are tried in turn until one is accepted, and the one that
-     * worked is remembered. A scope that is simply empty (6A88) still tells us
-     * the form was understood, so it counts as success here.
+     * A filtered listing is one entry, so it never chunks - which is why this
+     * can be the simple two-packet pair rather than the walk a full listing
+     * needs. The pair is still required: the card holds its answer behind
+     * 61 xx and loses it when the packet ends.
      */
-    private Ram getStatusOverRam(Sender sender, int scope, byte[] filter, boolean next)
+    private Ram getStatusFor(Sender sender, int scope, byte[] aid)
     {
-        if (statusForm >= 0)
-        {
-            byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
-                MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm));
-            return readPendingData(sender, apdu, sender.exchange(apdu), next);
-        }
+        boolean tlv = MslCore.statusFormIsTlv(Math.max(statusForm, 0));
+        boolean le = MslCore.statusFormHasLe(Math.max(statusForm, 0));
+        byte[] apdu = MslCore.buildGetStatusApdu(scope, aid, false, tlv, le);
 
-        Ram answer = null;
-        for (int i = 0; i < MslCore.STATUS_FORMS.length; i++)
-        {
-            int form = MslCore.STATUS_FORMS[i];
-            byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
-                MslCore.statusFormIsTlv(form), MslCore.statusFormHasLe(form));
+        Ram answer = sender.exchange(apdu);
+        if (!answer.packetAccepted() || answer.inner == null) { return answer; }
 
-            out.step("trying " + MslCore.statusFormLabel(form) + ": " + MslCore.hex(apdu));
-            answer = sender.exchange(apdu);
+        int length = MslCore.pendingLength(answer.inner.statusWord);
+        if (length < 0) { return answer; }
 
-            // A packet the card would not take says nothing about the form, so
-            // there is no point walking the rest of them.
-            if (!answer.packetAccepted() || answer.inner == null) { return answer; }
-
-            int status = answer.inner.statusWord;
-            if (status == 0x9000 || status == 0x6310 || status == 0x6A88
-                || MslCore.hasPendingData(status))
-            {
-                // 61 xx is not a refusal: it is the card saying the command ran
-                // and its data is waiting to be read. The form is good.
-                statusForm = form;
-                out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
-                return readPendingData(sender, apdu, answer, next);
-            }
-            out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
-                     + extraCommands(answer, 1));
-        }
-        return answer;
-    }
-
-    /**
-     * Reads data the card said was waiting, by re-sending the command with a
-     * GET RESPONSE after it in the same script.
-     *
-     * Inside a secured packet there is no transport layer to do this: the card
-     * manager runs the script under T=0 rules, so a command that produced data
-     * answers 61 xx and hands nothing over until a GET RESPONSE asks for it.
-     * Since the compact response format reports only the LAST command's data,
-     * putting the GET RESPONSE last is exactly what makes the answer come back.
-     *
-     * The command is repeated rather than the GET RESPONSE sent alone: whether
-     * a card keeps its pending response between two secured packets is not
-     * something any specification promises, and a run that assumed it would
-     * silently read nothing.
-     *
-     * One retry, for the card that answers 6C yy - "wrong length, ask for yy".
-     */
-    private Ram readPendingData(Sender sender, byte[] command, Ram answer, boolean continuation)
-    {
-        for (int attempt = 0; attempt < 3; attempt++)
-        {
-            if (answer == null || answer.inner == null) { return answer; }
-
-            int status = answer.inner.statusWord;
-            int length = MslCore.pendingLength(status);
-            if (length < 0) { return answer; }
-
-            byte[] getResponse = MslCore.buildGetResponseApdu(length);
-
-            if (continuation)
-            {
-                // A continuation must NOT be re-sent. GET STATUS with the
-                // next-occurrence bit advances the card's own cursor, so
-                // repeating it walks past the very bytes it just offered - the
-                // live card proved it: 615F (95 bytes waiting), re-sent, then
-                // 6724 (wrong length, 36) because the listing had moved on and
-                // that chunk was gone. The card keeps its pending response
-                // between packets, which the same run also proved by carrying
-                // the cursor across them, so the GET RESPONSE goes on its own.
-                out.info(MslCore.hexWord(status) + ": " + length + " byte(s) waiting - asking "
-                         + "for them on their own, because re-sending the command would advance "
-                         + "the card's listing past them");
-                answer = sender.exchange(getResponse);
-            }
-            else
-            {
-                out.info(MslCore.hexWord(status) + ": the card has " + length + " byte(s) "
-                         + "waiting, so the script is sent again with a GET RESPONSE after the "
-                         + "command");
-                answer = sender.exchange(MslCore.commandScript(command, getResponse));
-            }
-        }
-        return answer;
+        Ram read = readChunk(sender, apdu, length);
+        return read == null ? answer : read;
     }
 
     /**
@@ -1033,71 +948,219 @@ public class MslScript extends SCP02Script
             + " was sent, so it read trailing bytes as another command";
     }
 
+    /**
+     * The command script that re-walks a listing to chunk `chunk`.
+     *
+     * GET STATUS with P2=00 restarts the listing and GET STATUS with the
+     * next-occurrence bit advances it by one chunk, so the whole walk fits in
+     * one packet and is idempotent: every attempt starts from the beginning.
+     * That is what makes this safe. A continuation sent on its own advances the
+     * card's cursor and the chunk it was offering is gone - proven live, twice.
+     */
+    private byte[] listingScript(int scope, int chunk)
+    {
+        boolean tlv = MslCore.statusFormIsTlv(Math.max(statusForm, 0));
+        boolean le = MslCore.statusFormHasLe(Math.max(statusForm, 0));
+
+        byte[] script = MslCore.buildGetStatusApdu(scope, new byte[0], false, tlv, le);
+        for (int i = 0; i < chunk; i++)
+        {
+            script = MslCore.commandScript(script,
+                MslCore.buildGetStatusApdu(scope, new byte[0], true, tlv, le));
+        }
+        return script;
+    }
+
+    /**
+     * One GET STATUS scope over OTA, chunk by chunk.
+     *
+     * Two packets per chunk: one to ask how long it is (the card answers
+     * 61 xx), one to walk to it again and read it with a GET RESPONSE at the
+     * end. The second packet repeats the walk because the pending data does not
+     * survive the first - also proven live, when a GET RESPONSE sent alone in
+     * the next packet answered 6F00 with nothing behind it.
+     *
+     * It costs a packet more per chunk than a card that keeps its response
+     * would need, and it is the only shape that cannot silently lose entries.
+     */
     private int listOverRam(Sender sender, int scope)
     {
         out.heading("GET STATUS - " + MslCore.statusScopeLabel(scope) + " (over RAM)");
 
         int total = 0;
-        boolean next = false;
 
-        for (int round = 0; round < 8; round++)
+        for (int chunk = 0; chunk < 16; chunk++)
         {
-            Ram answer = getStatusOverRam(sender, scope, new byte[0], next);
-            if (!answer.packetAccepted())
+            // The form has to be settled before the script is built: the walk
+            // and the GET RESPONSE that reads it must be the same shape, or the
+            // card answers one and refuses the other.
+            Ram probe;
+            byte[] script;
+            if (chunk == 0)
             {
-                out.error(answer.describe());
-                return total;
+                probe = firstChunkProbe(sender, scope);
+                script = listingScript(scope, 0);
             }
-            if (answer.inner == null)
+            else
+            {
+                script = listingScript(scope, chunk);
+                if (script.length + 5 > MslCapLoad.MAX_OTA_APDU)
+                {
+                    out.warn("the walk to chunk " + (chunk + 1) + " no longer fits one packet; "
+                             + "the listing stops here and is incomplete");
+                    browseIncomplete = true;
+                    return total;
+                }
+                out.step("walking to chunk " + (chunk + 1) + ": " + MslCore.hex(script));
+                probe = sender.exchange(script);
+            }
+            if (!probe.packetAccepted())
+            {
+                out.error(probe.describe());
+                return endScope(total, chunk);
+            }
+            if (probe.inner == null)
             {
                 out.warn("PoR 00 with no response data: the card manager executed nothing this "
                          + "run can read. A card that answers this to GET STATUS is usually "
                          + "refusing card content management to this key set.");
+                return endScope(total, chunk);
+            }
+
+            int status = probe.inner.statusWord;
+            if (status == 0x6A88)
+            {
+                out.info("6A88: the card has nothing more in this scope - an empty "
+                         + "section, not an error.");
                 return total;
             }
 
-            int status = answer.inner.statusWord;
-            if (status == 0x6A88)
+            Ram read = probe;
+            int length = MslCore.pendingLength(status);
+            if (length >= 0)
             {
-                // An empty section, not a failure: the card understood the
-                // command and has nothing in this scope.
-                out.info("6A88: the card has nothing in this scope - an empty registry section, "
-                         + "not an error.");
-                return total;
+                read = readChunk(sender, script, length);
+                if (read == null) { return endScope(total, chunk); }
+                status = read.inner.statusWord;
             }
+
             if (status != 0x9000 && status != 0x6310)
             {
                 out.error("the card manager answered " + MslCore.hexWord(status)
-                          + " to GET STATUS" + extraCommands(answer, next ? 1 : 2));
-                if (statusForm < 0)
+                          + " to GET STATUS" + extraCommands(read, countCommands(script) + 1));
+                if (statusForm < 0 && chunk == 0)
                 {
                     out.info("Every GET STATUS form this tool knows was refused. The key set "
                              + "reaches the card manager - the packet was accepted - so this is "
                              + "the card refusing card content management to it, not a transport "
                              + "problem.");
+                    return total;
                 }
-                else
-                {
-                    out.warn("The listing for this scope is INCOMPLETE: " + total + " entr"
-                             + (total == 1 ? "y was" : "ies were") + " read before the card "
-                             + "stopped answering. What is above is real; what is missing is "
-                             + "unknown.");
-                    browseIncomplete = true;
-                }
-                return total;
+                return endScope(total, chunk);
             }
 
-            total += printRegistry(answer.inner.data, scope);
+            total += printRegistry(read.inner.data, scope);
 
             if (status != 0x6310) { return total; }
 
-            out.info("6310: the card has more entries in this scope, asking for the next ones");
-            next = true;
+            out.info("6310: the card has more entries in this scope, walking to the next chunk");
         }
 
-        out.warn("stopped after 8 continuations - the card kept saying 6310. The listing above is "
-                 + "incomplete.");
+        out.warn("stopped after 16 chunks - the card kept saying 6310");
+        browseIncomplete = true;
         return total;
+    }
+
+    /**
+     * Reads the chunk the walk ends on, with one correction.
+     *
+     * 6C yy and 67 yy both mean "wrong length, it is yy" and both are worth
+     * following, because the walk is idempotent: asking again costs a packet
+     * and nothing else. Null means the attempt failed and the caller should
+     * stop.
+     */
+    private Ram readChunk(Sender sender, byte[] script, int length)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            out.info("reading " + length + " byte(s) with a GET RESPONSE at the end of the walk");
+
+            Ram read = sender.exchange(MslCore.commandScript(script,
+                                       MslCore.buildGetResponseApdu(length)));
+            if (!read.packetAccepted() || read.inner == null)
+            {
+                out.error(read.describe());
+                return null;
+            }
+
+            int corrected = MslCore.pendingLength(read.inner.statusWord);
+            if (corrected < 0 || corrected == length) { return read; }
+
+            out.info(MslCore.hexWord(read.inner.statusWord) + ": the card wants " + corrected
+                     + " byte(s) asked for instead, so the walk is repeated with that length");
+            length = corrected;
+        }
+        return null;
+    }
+
+    /** The first chunk, where the GET STATUS form is still being established. */
+    private Ram firstChunkProbe(Sender sender, int scope)
+    {
+        if (statusForm >= 0)
+        {
+            return sender.exchange(listingScript(scope, 0));
+        }
+
+        Ram answer = null;
+        for (int i = 0; i < MslCore.STATUS_FORMS.length; i++)
+        {
+            int form = MslCore.STATUS_FORMS[i];
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, new byte[0], false,
+                MslCore.statusFormIsTlv(form), MslCore.statusFormHasLe(form));
+
+            out.step("trying " + MslCore.statusFormLabel(form) + ": " + MslCore.hex(apdu));
+            answer = sender.exchange(apdu);
+
+            if (!answer.packetAccepted() || answer.inner == null) { return answer; }
+
+            int status = answer.inner.statusWord;
+            if (status == 0x9000 || status == 0x6310 || status == 0x6A88
+                || MslCore.hasPendingData(status))
+            {
+                statusForm = form;
+                out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
+                return answer;
+            }
+            out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
+                     + extraCommands(answer, 1));
+        }
+        return answer;
+    }
+
+    private int endScope(int total, int chunk)
+    {
+        if (chunk > 0 || total > 0)
+        {
+            out.warn("The listing for this scope is INCOMPLETE: " + total + " entr"
+                     + (total == 1 ? "y was" : "ies were") + " read before the card stopped "
+                     + "answering. What is above is real; what is missing is unknown.");
+            browseIncomplete = true;
+        }
+        return total;
+    }
+
+    /** How many APDUs a script carries, for the "more commands than sent" note. */
+    private static int countCommands(byte[] script)
+    {
+        int commands = 0;
+        int pos = 0;
+        while (pos + 5 <= script.length)
+        {
+            commands++;
+            pos += 5 + ((script[pos] == 0x00 && (script[pos + 1] & 0xFF) == 0xC0)
+                        ? 0 : (script[pos + 4] & 0xFF));
+        }
+        return commands;
     }
 
     /**
@@ -1361,7 +1424,7 @@ public class MslScript extends SCP02Script
     /** True when a GET STATUS over RAM, filtered on this AID, finds it. */
     private boolean ramRegistryHolds(Sender sender, int scope, byte[] aid)
     {
-        Ram answer = getStatusOverRam(sender, scope, aid, false);
+        Ram answer = getStatusFor(sender, scope, aid);
 
         if (!answer.packetAccepted() || answer.inner == null)
         {
