@@ -1002,6 +1002,30 @@ public final class MslCore
     public static byte[] buildGetStatusApdu(int p1, byte[] aidFilter, boolean nextOccurrence,
                                             boolean tlvFormat)
     {
+        // No Le: this tool's GET STATUS goes inside a secured packet far more
+        // often than through a secure channel, and the RAM case is the one
+        // where the byte does damage. The contact path asks for it explicitly.
+        return buildGetStatusApdu(p1, aidFilter, nextOccurrence, tlvFormat, false);
+    }
+
+    /**
+     * The same command, with the two things cards disagree about made explicit.
+     *
+     * `withLe` controls the trailing 00. GET STATUS is a case 4 command and the
+     * byte belongs there over a contact channel, but inside a secured packet the
+     * answer comes back in the response packet rather than through a GET
+     * RESPONSE, and some card managers parse the command script strictly enough
+     * that the extra byte is an error. `tlvFormat` picks the GlobalPlatform 2.2
+     * TLV response over the deprecated one, which a 2.2-only card may require.
+     *
+     * Neither can be decided from a specification: the MCI/Hamrah card answered
+     * 6F00 - no precise diagnosis - to the form that every other card here
+     * accepts. So MslScript sends the forms in turn until one is accepted and
+     * then stays with it, and says in the log which one the card wanted.
+     */
+    public static byte[] buildGetStatusApdu(int p1, byte[] aidFilter, boolean nextOccurrence,
+                                            boolean tlvFormat, boolean withLe)
+    {
         byte[] filter = (aidFilter == null) ? new byte[0] : aidFilter;
         if (filter.length > 0x10)
         {
@@ -1013,7 +1037,34 @@ public final class MslCore
         int p2 = (nextOccurrence ? 0x01 : 0x00) | (tlvFormat ? 0x02 : 0x00);
 
         byte[] header = { (byte) 0x80, (byte) 0xF2, (byte) p1, (byte) p2, (byte) data.length };
-        return concat(concat(header, data), new byte[] { 0x00 });
+        byte[] apdu = concat(header, data);
+        return withLe ? concat(apdu, new byte[] { 0x00 }) : apdu;
+    }
+
+    // ------------------------------------------------------------------
+    // The GET STATUS forms, in the order they are worth trying
+    // ------------------------------------------------------------------
+
+    /**
+     * bit 0 set = send Le; bit 1 set = ask for the TLV response format.
+     *
+     * No-Le first, because that is what a RAM command script wants and because
+     * the MCI/Hamrah card proved why: sent WITH the Le byte it answered "2
+     * commands executed, last one 6F00" to a script carrying one command. It
+     * had read the trailing 00 as the start of a second, malformed command -
+     * and since the compact response format reports only the last command's
+     * status and data, the GET STATUS answer was thrown away.
+     */
+    public static final int[] STATUS_FORMS = { 0, 1, 2, 3 };
+
+    public static boolean statusFormHasLe(int form)  { return (form & 1) != 0; }
+    public static boolean statusFormIsTlv(int form)  { return (form & 2) != 0; }
+
+    public static String statusFormLabel(int form)
+    {
+        return (statusFormIsTlv(form) ? "TLV response format (P2 bit b2)"
+                                      : "deprecated response format")
+            + (statusFormHasLe(form) ? ", with Le" : ", without Le");
     }
 
     /**
@@ -1032,6 +1083,21 @@ public final class MslCore
      */
     public static byte[] buildDeleteApdu(byte[] aid, boolean withRelatedObjects)
     {
+        return buildDeleteApdu(aid, withRelatedObjects, false);
+    }
+
+    /**
+     * The same command, with the trailing Le made explicit.
+     *
+     * Over a contact channel DELETE is a case 4 command and the byte belongs
+     * there. Inside a secured packet it must NOT be sent: a RAM command script
+     * is a sequence of case 3 APDUs, and a card that finds a byte after the
+     * data reads it as the start of another command. That is not a guess -
+     * the MCI/Hamrah card did exactly that to GET STATUS and reported two
+     * commands executed where one was sent.
+     */
+    public static byte[] buildDeleteApdu(byte[] aid, boolean withRelatedObjects, boolean withLe)
+    {
         if (aid == null || aid.length < 5 || aid.length > 16)
         {
             throw new IllegalArgumentException("an AID is 5 to 16 bytes, got "
@@ -1041,7 +1107,8 @@ public final class MslCore
         byte[] data = tlv(0x4F, aid);
         byte[] header = { (byte) 0x80, (byte) 0xE4, 0x00,
                           (byte) (withRelatedObjects ? 0x80 : 0x00), (byte) data.length };
-        return concat(concat(header, data), new byte[] { 0x00 });
+        byte[] apdu = concat(header, data);
+        return withLe ? concat(apdu, new byte[] { 0x00 }) : apdu;
     }
 
     /** A status word as four hex digits, for log lines and notes. */

@@ -579,26 +579,54 @@ def scope_carries_modules(p1):
     return p1 == STATUS_LOAD_FILES_AND_MODULES
 
 
-def build_get_status_apdu(p1, aid_filter=b"", next_occurrence=False, tlv_format=False):
+def build_get_status_apdu(p1, aid_filter=b"", next_occurrence=False, tlv_format=False,
+                          with_le=False):
     """
     GET STATUS.
 
     P2 bit b1 is "next occurrence" (the continuation after a 6310) and bit b2
     picks the response format: clear for the deprecated/compact format every
     card answers, set for the GlobalPlatform 2.2 TLV format. An empty AID filter
-    means "list everything", which is tag 4F with length 00. Le is present and
-    00 -- GET STATUS is case 4, and over RAM the answer comes back inside the
-    response packet.
+    means "list everything", which is tag 4F with length 00.
+
+    with_le defaults to FALSE, which is the opposite of what a contact channel
+    wants, and the MCI/Hamrah card is why. GET STATUS is a case 4 command, so
+    the trailing 00 belongs there over the contact interface -- but a RAM
+    command script is a sequence of case 3 APDUs, and that card read the Le
+    byte as the start of a second command: it answered "2 commands executed,
+    last one 6F00" to a script carrying one. Since the compact response format
+    reports only the LAST command's status and data, the GET STATUS answer was
+    thrown away. Over RAM, leave this False.
     """
     aid_filter = bytes(aid_filter)
     if len(aid_filter) > 0x10:
         raise ValueError("an AID is 5 to 16 bytes; this filter is %d" % len(aid_filter))
     data = _tlv(0x4F, aid_filter)
     p2 = (0x01 if next_occurrence else 0x00) | (0x02 if tlv_format else 0x00)
-    return bytes(bytearray([0x80, 0xF2, p1, p2, len(data)])) + data + b"\x00"
+    apdu = bytes(bytearray([0x80, 0xF2, p1, p2, len(data)])) + data
+    return apdu + b"\x00" if with_le else apdu
 
 
-def build_delete_apdu(aid, with_related_objects=False):
+# bit 0 set = send Le; bit 1 set = ask for the TLV response format. No-Le first,
+# for the reason above; the browse job walks these until the card accepts one.
+STATUS_FORMS = (0, 1, 2, 3)
+
+
+def status_form_has_le(form):
+    return bool(form & 1)
+
+
+def status_form_is_tlv(form):
+    return bool(form & 2)
+
+
+def status_form_label(form):
+    return ("TLV response format (P2 bit b2)" if status_form_is_tlv(form)
+            else "deprecated response format") \
+        + (", with Le" if status_form_has_le(form) else ", without Le")
+
+
+def build_delete_apdu(aid, with_related_objects=False, with_le=False):
     """
     DELETE [card content].
 
@@ -609,13 +637,18 @@ def build_delete_apdu(aid, with_related_objects=False):
     more than was intended, so it is never a default: the caller names every AID
     it is about to remove first. There is no undo, and a deleted instance takes
     its install parameters (the MSL this tool measures) with it.
+
+    with_le defaults to False for the same reason as GET STATUS: inside a
+    secured packet the trailing byte is read as another command. Pass True only
+    when sending this through a contact-interface secure channel.
     """
     aid = bytes(aid)
     if not 5 <= len(aid) <= 16:
         raise ValueError("an AID is 5 to 16 bytes, got %d" % len(aid))
     data = _tlv(0x4F, aid)
     p2 = 0x80 if with_related_objects else 0x00
-    return bytes(bytearray([0x80, 0xE4, 0x00, p2, len(data)])) + data + b"\x00"
+    apdu = bytes(bytearray([0x80, 0xE4, 0x00, p2, len(data)])) + data
+    return apdu + b"\x00" if with_le else apdu
 
 
 def parse_ram_response(response_data):

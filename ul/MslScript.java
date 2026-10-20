@@ -1108,6 +1108,30 @@ final class MslCore
     public static byte[] buildGetStatusApdu(int p1, byte[] aidFilter, boolean nextOccurrence,
                                             boolean tlvFormat)
     {
+        // No Le: this tool's GET STATUS goes inside a secured packet far more
+        // often than through a secure channel, and the RAM case is the one
+        // where the byte does damage. The contact path asks for it explicitly.
+        return buildGetStatusApdu(p1, aidFilter, nextOccurrence, tlvFormat, false);
+    }
+
+    /**
+     * The same command, with the two things cards disagree about made explicit.
+     *
+     * `withLe` controls the trailing 00. GET STATUS is a case 4 command and the
+     * byte belongs there over a contact channel, but inside a secured packet the
+     * answer comes back in the response packet rather than through a GET
+     * RESPONSE, and some card managers parse the command script strictly enough
+     * that the extra byte is an error. `tlvFormat` picks the GlobalPlatform 2.2
+     * TLV response over the deprecated one, which a 2.2-only card may require.
+     *
+     * Neither can be decided from a specification: the MCI/Hamrah card answered
+     * 6F00 - no precise diagnosis - to the form that every other card here
+     * accepts. So MslScript sends the forms in turn until one is accepted and
+     * then stays with it, and says in the log which one the card wanted.
+     */
+    public static byte[] buildGetStatusApdu(int p1, byte[] aidFilter, boolean nextOccurrence,
+                                            boolean tlvFormat, boolean withLe)
+    {
         byte[] filter = (aidFilter == null) ? new byte[0] : aidFilter;
         if (filter.length > 0x10)
         {
@@ -1119,7 +1143,34 @@ final class MslCore
         int p2 = (nextOccurrence ? 0x01 : 0x00) | (tlvFormat ? 0x02 : 0x00);
 
         byte[] header = { (byte) 0x80, (byte) 0xF2, (byte) p1, (byte) p2, (byte) data.length };
-        return concat(concat(header, data), new byte[] { 0x00 });
+        byte[] apdu = concat(header, data);
+        return withLe ? concat(apdu, new byte[] { 0x00 }) : apdu;
+    }
+
+    // ------------------------------------------------------------------
+    // The GET STATUS forms, in the order they are worth trying
+    // ------------------------------------------------------------------
+
+    /**
+     * bit 0 set = send Le; bit 1 set = ask for the TLV response format.
+     *
+     * No-Le first, because that is what a RAM command script wants and because
+     * the MCI/Hamrah card proved why: sent WITH the Le byte it answered "2
+     * commands executed, last one 6F00" to a script carrying one command. It
+     * had read the trailing 00 as the start of a second, malformed command -
+     * and since the compact response format reports only the last command's
+     * status and data, the GET STATUS answer was thrown away.
+     */
+    public static final int[] STATUS_FORMS = { 0, 1, 2, 3 };
+
+    public static boolean statusFormHasLe(int form)  { return (form & 1) != 0; }
+    public static boolean statusFormIsTlv(int form)  { return (form & 2) != 0; }
+
+    public static String statusFormLabel(int form)
+    {
+        return (statusFormIsTlv(form) ? "TLV response format (P2 bit b2)"
+                                      : "deprecated response format")
+            + (statusFormHasLe(form) ? ", with Le" : ", without Le");
     }
 
     /**
@@ -1138,6 +1189,21 @@ final class MslCore
      */
     public static byte[] buildDeleteApdu(byte[] aid, boolean withRelatedObjects)
     {
+        return buildDeleteApdu(aid, withRelatedObjects, false);
+    }
+
+    /**
+     * The same command, with the trailing Le made explicit.
+     *
+     * Over a contact channel DELETE is a case 4 command and the byte belongs
+     * there. Inside a secured packet it must NOT be sent: a RAM command script
+     * is a sequence of case 3 APDUs, and a card that finds a byte after the
+     * data reads it as the start of another command. That is not a guess -
+     * the MCI/Hamrah card did exactly that to GET STATUS and reported two
+     * commands executed where one was sent.
+     */
+    public static byte[] buildDeleteApdu(byte[] aid, boolean withRelatedObjects, boolean withLe)
+    {
         if (aid == null || aid.length < 5 || aid.length > 16)
         {
             throw new IllegalArgumentException("an AID is 5 to 16 bytes, got "
@@ -1147,7 +1213,8 @@ final class MslCore
         byte[] data = tlv(0x4F, aid);
         byte[] header = { (byte) 0x80, (byte) 0xE4, 0x00,
                           (byte) (withRelatedObjects ? 0x80 : 0x00), (byte) data.length };
-        return concat(concat(header, data), new byte[] { 0x00 });
+        byte[] apdu = concat(header, data);
+        return withLe ? concat(apdu, new byte[] { 0x00 }) : apdu;
     }
 
     /** A status word as four hex digits, for log lines and notes. */
@@ -6183,6 +6250,78 @@ public class MslScript extends SCP02Script
      * another packet and another counter step, so the walk is bounded: a card
      * that answers 6310 forever would otherwise empty the counter space.
      */
+    /**
+     * The GET STATUS form this card accepts. -1 until one has answered, then
+     * reused for every later scope and continuation in the run.
+     */
+    private int statusForm = -1;
+
+    /**
+     * GET STATUS over RAM, in a form this card will actually act on.
+     *
+     * Two things cards disagree about - the trailing Le and the response
+     * format - and neither can be settled from a specification. The MCI/Hamrah
+     * card answered 6F00 to the form every other card here accepts, and said
+     * why in its own response: two commands executed where one was sent. It had
+     * read the Le byte as the start of a second command, and the compact
+     * response format reports only the last command's status, so the GET STATUS
+     * answer was discarded.
+     *
+     * So the forms are tried in turn until one is accepted, and the one that
+     * worked is remembered. A scope that is simply empty (6A88) still tells us
+     * the form was understood, so it counts as success here.
+     */
+    private Ram getStatusOverRam(Sender sender, int scope, byte[] filter, boolean next)
+    {
+        if (statusForm >= 0)
+        {
+            return sender.exchange(MslCore.buildGetStatusApdu(scope, filter, next,
+                MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm)));
+        }
+
+        Ram answer = null;
+        for (int i = 0; i < MslCore.STATUS_FORMS.length; i++)
+        {
+            int form = MslCore.STATUS_FORMS[i];
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
+                MslCore.statusFormIsTlv(form), MslCore.statusFormHasLe(form));
+
+            out.step("trying " + MslCore.statusFormLabel(form) + ": " + MslCore.hex(apdu));
+            answer = sender.exchange(apdu);
+
+            // A packet the card would not take says nothing about the form, so
+            // there is no point walking the rest of them.
+            if (!answer.packetAccepted() || answer.inner == null) { return answer; }
+
+            int status = answer.inner.statusWord;
+            if (status == 0x9000 || status == 0x6310 || status == 0x6A88)
+            {
+                statusForm = form;
+                out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
+                return answer;
+            }
+            out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
+                     + extraCommands(answer));
+        }
+        return answer;
+    }
+
+    /**
+     * The card's own evidence that an APDU carried more than one command.
+     *
+     * The compact RAM response counts the commands the card executed. More than
+     * one from a script carrying one means the card read trailing bytes as
+     * another command - which is exactly how a stray Le byte throws away the
+     * answer to the command that mattered.
+     */
+    private String extraCommands(Ram answer)
+    {
+        if (answer == null || answer.inner == null || answer.inner.commands <= 1) { return ""; }
+
+        return " - and reported " + answer.inner.commands + " commands executed where one was "
+            + "sent, so it read trailing bytes as a second command";
+    }
+
     private int listOverRam(Sender sender, int scope)
     {
         out.heading("GET STATUS - " + MslCore.statusScopeLabel(scope) + " (over RAM)");
@@ -6192,10 +6331,7 @@ public class MslScript extends SCP02Script
 
         for (int round = 0; round < 8; round++)
         {
-            byte[] apdu = MslCore.buildGetStatusApdu(scope, new byte[0], next, false);
-            out.step("sending " + MslCore.hex(apdu));
-
-            Ram answer = sender.exchange(apdu);
+            Ram answer = getStatusOverRam(sender, scope, new byte[0], next);
             if (!answer.packetAccepted())
             {
                 out.error(answer.describe());
@@ -6210,15 +6346,21 @@ public class MslScript extends SCP02Script
             }
 
             int status = answer.inner.statusWord;
+            if (status == 0x6A88)
+            {
+                // An empty section, not a failure: the card understood the
+                // command and has nothing in this scope.
+                out.info("6A88: the card has nothing in this scope - an empty registry section, "
+                         + "not an error.");
+                return total;
+            }
             if (status != 0x9000 && status != 0x6310)
             {
                 out.error("the card manager answered " + MslCore.hexWord(status)
-                          + " to GET STATUS");
-                if (status == 0x6A88)
-                {
-                    out.info("6A88 here means the card has nothing in this scope - an empty "
-                             + "registry section, not an error.");
-                }
+                          + " to GET STATUS" + extraCommands(answer));
+                out.info("Every GET STATUS form this tool knows was refused. The key set reaches "
+                         + "the card manager - the packet was accepted - so this is the card "
+                         + "refusing card content management to it, not a transport problem.");
                 return total;
             }
 
@@ -6362,8 +6504,7 @@ public class MslScript extends SCP02Script
     /** True when a GET STATUS over RAM, filtered on this AID, finds it. */
     private boolean ramRegistryHolds(Sender sender, int scope, byte[] aid)
     {
-        byte[] apdu = MslCore.buildGetStatusApdu(scope, aid, false, false);
-        Ram answer = sender.exchange(apdu);
+        Ram answer = getStatusOverRam(sender, scope, aid, false);
 
         if (!answer.packetAccepted() || answer.inner == null)
         {
@@ -6414,7 +6555,12 @@ public class MslScript extends SCP02Script
      */
     private void deleteObject()
     {
-        byte[] apdu = MslCore.buildDeleteApdu(cfg.deleteAid, cfg.deleteRelatedObjects);
+        // Over a contact channel DELETE is a case 4 command and carries its Le;
+        // inside a secured packet it must not, or the card reads that byte as
+        // the start of another command (which is what it did to GET STATUS).
+        boolean overSecureChannel = cfg.transport == MslConfig.TRANSPORT_ISD;
+        byte[] apdu = MslCore.buildDeleteApdu(cfg.deleteAid, cfg.deleteRelatedObjects,
+                                              overSecureChannel);
 
         out.heading("What would be deleted");
         out.info("AID              : " + MslCore.hex(cfg.deleteAid));

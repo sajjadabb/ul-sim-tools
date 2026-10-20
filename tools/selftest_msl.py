@@ -303,12 +303,22 @@ check("the tolerant walk still parses a truncated block to 'no MSL' - which is e
 # depending on which half of the tool reached it.
 # ---------------------------------------------------------------------------
 
-check("GET STATUS for applications is 80 F2 40 00 02 4F 00 00",
-      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS)) == "80F24000024F0000",
+# No Le by default: over RAM a trailing byte is read as a second command. The
+# card that proved it is in the wire vectors below.
+check("GET STATUS for applications is 80 F2 40 00 02 4F 00, with no Le",
+      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS)) == "80F24000024F00",
       m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS)))
+check("asking for Le explicitly appends exactly one byte",
+      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS, b"", False, False, True))
+      == "80F24000024F0000")
 check("an AID filter goes in tag 4F",
       m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS, m.unhex("A000000009")))
-      == "80F24000074F05A00000000900")
+      == "80F24000074F05A000000009")
+check("the GET STATUS forms are tried no-Le first",
+      m.STATUS_FORMS[0] == 0 and not m.status_form_has_le(m.STATUS_FORMS[0]))
+check("the forms cover both axes: Le and response format",
+      sorted(m.STATUS_FORMS) == [0, 1, 2, 3]
+      and m.status_form_is_tlv(2) and not m.status_form_is_tlv(1))
 check("the next-occurrence continuation sets P2 bit b1",
       bytearray(m.build_get_status_apdu(m.STATUS_APPLICATIONS, b"", True))[3] == 0x01)
 check("asking for the TLV response format sets P2 bit b2",
@@ -317,10 +327,13 @@ check("the load-file scope asks for modules too (P1 10)",
       m.scope_carries_modules(m.STATUS_LOAD_FILES_AND_MODULES)
       and not m.scope_carries_modules(m.STATUS_LOAD_FILES))
 
-check("DELETE of an instance is 80 E4 00 00, tag 4F, Le 00",
+check("DELETE of an instance is 80 E4 00 00 with tag 4F and no Le",
       m.hexs(m.build_delete_apdu(m.unhex("A000000009000102")))
-      == "80E400000A4F08A00000000900010200",
+      == "80E400000A4F08A000000009000102",
       m.hexs(m.build_delete_apdu(m.unhex("A000000009000102"))))
+check("DELETE through a secure channel can still ask for its Le",
+      m.hexs(m.build_delete_apdu(m.unhex("A000000009000102"), False, True))
+      == "80E400000A4F08A00000000900010200")
 check("DELETE with related objects sets P2 to 80 - the cascade, not a different command",
       bytearray(m.build_delete_apdu(m.unhex("A000000009"), True))[3] == 0x80)
 check("DELETE refuses an AID too short to be one",
@@ -441,6 +454,25 @@ check("the module inside the package is read - the AID an INSTALL needs",
 
 # A DELETE that worked and one for an AID the card does not have arrive inside
 # the same accepted packet; only the inner word tells them apart.
+# A REAL response packet, off the MCI/Hamrah card on 2026-10-20, answering a
+# GET STATUS that still carried its Le byte. The packet was accepted (PoR 00)
+# and the card still threw the answer away: it executed TWO commands, because
+# it read that trailing 00 as the start of another one, and the compact format
+# reports only the last. This is the vector that justifies the no-Le default.
+_REAL_6F00 = ("027100" "0016" "12" "000000" "0005000000" "00" "00"
+              "1F4D4F3509263305" "026F00")
+_por, _ram, _ = ram_chain(_REAL_6F00, m.STATUS_APPLICATIONS)
+check("the real card's packet was accepted - PoR 00",
+      _por is not None and _por["status"] == 0x00)
+check("its counter and TAR read back as sent",
+      _por["counter"] == "0005000000" and _por["tar"] == "000000")
+check("the card reported TWO commands executed where one was sent",
+      _ram is not None and _ram["commands"] == 2, _ram and _ram["commands"])
+check("the last of them answered 6F00, which is what reached the operator",
+      _ram is not None and _ram["sw"] == 0x6F00)
+check("and no registry data survived it",
+      _ram is not None and _ram["data"] == b"")
+
 _por, _ram, _ = ram_chain(_DELETE_OK, m.STATUS_APPLICATIONS)
 check("a DELETE that worked: PoR 00 and card SW 9000",
       _por["status"] == 0x00 and _ram["sw"] == 0x9000 and _ram["data"] == b"")
