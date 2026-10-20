@@ -1,0 +1,57 @@
+# Optional, non-secret pre-fill for the run dialog.
+#
+# Copy to msl.properties and fill in what is stable for your lab, so nobody
+# retypes an ISD AID forty times. Every value here is still editable in the
+# dialog, and the run cannot start until the operator confirms the values match
+# the SIM actually in the reader.
+#
+# KEY MATERIAL IS NOT LOADABLE FROM HERE. Entries whose name contains key, adm,
+# pin or puk are dropped on load and a line is printed saying so. Keys are typed
+# fresh every run because test SIMs get swapped between runs, and a key that
+# survives a card swap is a key that gets sent to the wrong card.
+
+card.label = MCI test SIM #1
+operator   =
+
+# --- GlobalPlatform, for MslInstallScript --------------------------------
+# Run DiscoverSecurityDomainsScript (sim-kvn-provisioning) if the documented
+# card manager AID answers 6A82 - it reads the real one out of the card's own
+# registry.
+isd.aid   =
+scp02.kvn = 01
+
+# --- the applet to install ------------------------------------------------
+applet.cap         =
+applet.loadFileAid =
+applet.moduleAid   =
+applet.instanceAid =
+applet.privileges  = 00
+
+# --- the MSL to install ---------------------------------------------------
+# 12 = cryptographic checksum, no ciphering, counter must be higher.
+# This is the value the vendor spreadsheet documents for this card family;
+# it is a starting point for the dialog, not a claim about your applet.
+msl      = 12
+msl.tars =
+
+toolkit.priority       = 01
+toolkit.timers         = 00
+toolkit.menuTextLength = 00
+toolkit.channels       = 00
+
+# --- probing, for MslProbeScript ------------------------------------------
+probe.tar    =
+probe.budget = 24
+
+ota.kvn       = 01
+ota.algorithm = 3des2
+# SPI octet 2. 09 = PoR required, returned over SMS-DELIVER-REPORT.
+ota.spi2      = 09
+# The counter must be ABOVE the card's stored value or no PoR comes back at
+# all. Leave this empty rather than stale: a wrong counter looks exactly like a
+# wrong key. The last PoR of every run prints where the card actually is.
+ota.counter   =
+# A plain PC/SC reader never sends a TERMINAL PROFILE, so the card's toolkit
+# stays dormant and ignores every envelope - silently. On this card family 02
+# and FFFF both work; FF alone does not.
+ota.terminalProfile = 02

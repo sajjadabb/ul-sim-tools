@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>راهنمای کاربری MslScript در UL Mobile Card Test Platform</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --panel:#ffffff; --ink:#15202b; --ink2:#51606f; --ink3:#8a97a6;
+    --line:#e3e8ef; --soft:#eef2f7; --accent:#2457d6; --accent-soft:#eaf0ff;
+    --good:#0a7a43; --good-bg:#e9f7ef; --bad:#b4231b; --bad-bg:#fdecea;
+    --warn:#a85a07; --warn-bg:#fdf4e6; --mono:"Cascadia Mono",Consolas,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.9 "Segoe UI","Tahoma",sans-serif;}
+  .wrap{max-width:900px;margin:0 auto;padding:0 20px 80px;}
+  header.hero{background:linear-gradient(135deg,#15202b,#1f3350);color:#fff;
+       padding:34px 20px;margin-bottom:26px;}
+  header.hero .in{max-width:900px;margin:0 auto;}
+  header.hero h1{margin:0;font-size:25px;}
+  header.hero p{margin:6px 0 0;color:#b9c6d6;font-size:14px;}
+  h2{font-size:19px;margin:34px 0 10px;padding-bottom:7px;border-bottom:2px solid var(--line);}
+  h3{font-size:16px;margin:22px 0 6px;color:#24405e;}
+  p{margin:8px 0;}
+  code{font-family:var(--mono);background:var(--soft);padding:1px 6px;border-radius:5px;font-size:13px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(16,24,40,.05);}
+  .note{border-right:4px solid var(--accent);background:var(--accent-soft);
+        border-radius:8px;padding:10px 14px;margin:12px 0;font-size:14px;}
+  .warn{border-right:4px solid var(--warn);background:var(--warn-bg);
+        border-radius:8px;padding:10px 14px;margin:12px 0;font-size:14px;}
+  .good{border-right:4px solid var(--good);background:var(--good-bg);
+        border-radius:8px;padding:10px 14px;margin:12px 0;font-size:14px;}
+  table{border-collapse:collapse;width:100%;margin:12px 0;background:var(--panel);
+        border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:14px;}
+  th{background:#f3f6fa;color:var(--ink2);text-align:right;padding:9px 12px;
+     font-size:12.5px;border-bottom:1px solid var(--line);}
+  td{padding:9px 12px;border-bottom:1px solid var(--soft);vertical-align:top;}
+  tr:last-child td{border-bottom:0;}
+  .hex{font-family:var(--mono);direction:ltr;unicode-bidi:bidi-override;display:inline-block;}
+  ol,ul{margin:8px 0;padding-right:22px;}
+  li{margin:5px 0;}
+  .step{counter-reset:none;}
+  .pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:700;}
+  .pill.ok{background:var(--good-bg);color:var(--good);}
+  .pill.bad{background:var(--bad-bg);color:var(--bad);}
+  .pill.warn{background:var(--warn-bg);color:var(--warn);}
+  .toc{columns:2;font-size:14px;}
+  .toc a{color:var(--accent);text-decoration:none;}
+  .ltr{direction:ltr;text-align:left;font-family:var(--mono);background:#15202b;color:#d7e0ea;
+       padding:12px 14px;border-radius:8px;overflow-x:auto;font-size:13px;}
+  footer{color:var(--ink3);font-size:12.5px;margin-top:40px;text-align:center;}
+</style>
+</head>
+<body>
+
+<header class="hero"><div class="in">
+  <h1>راهنمای کاربری MslScript</h1>
+  <p>بررسی Minimum Security Level اپلت‌ها در UL Mobile Card Test Platform 3.8.0</p>
+</div></header>
+
+<div class="wrap">
+
+  <div class="card toc">
+    <strong>فهرست</strong>
+    <ul>
+      <li><a href="#what">MSL چیست؟</a></li>
+      <li><a href="#jobs">سه کار ابزار</a></li>
+      <li><a href="#setup">آماده‌سازی در UL</a></li>
+      <li><a href="#discover">کار ۱: discover</a></li>
+      <li><a href="#verify">کار ۲: verify</a></li>
+      <li><a href="#install">کار ۳: install</a></li>
+      <li><a href="#fields">مرجع فیلدها</a></li>
+      <li><a href="#read">خواندن نتیجه</a></li>
+      <li><a href="#trouble">عیب‌یابی</a></li>
+      <li><a href="#safety">نکات امنیتی</a></li>
+    </ul>
+  </div>
+
+  <h2 id="what">MSL چیست و چرا با probe سنجیده می‌شود؟</h2>
+  <p>هر اپلت روی UICC یک <b>Minimum Security Level</b> دارد که هنگام نصب در پارامترهای
+  INSTALL تثبیت می‌شود (ETSI TS 102 226، بند 8.2.1.3.2). وقتی یک بستهٔ امن OTA برای TAR آن
+  اپلت می‌رسد، کارت سطح امنیتی بسته (اوکتت اول SPI) را با MSL مقایسه می‌کند و اگر کمتر بود،
+  <b>قبل از</b> بررسی MAC و کانتر، آن را رد می‌کند.</p>
+  <p>هیچ دستوری MSL را از کارت نمی‌خواند — MSL از بیرون «نوشتنی» است، نه «خواندنی». پس تنها
+  راه فهمیدنش، <b>رفتار کارت</b> در برابر بسته‌های با سطوح مختلف است. این کار همان probe است.</p>
+
+  <div class="note">
+    MSL سه محور دارد که هر کدام جدا بررسی می‌شوند:
+    <b>یکپارچگی</b> (none / RC / CC / DS)، <b>رمزنگاری</b> (off / on)،
+    <b>کانتر</b> (no-counter / no-check / higher / one-higher). بایت <span class="hex">0x12</span>
+    یعنی «CC، بدون ciphering، counter-higher».
+  </div>
+
+  <h2 id="jobs">سه کار ابزار</h2>
+  <table>
+    <tr><th>کار</th><th>چه می‌کند</th><th>کارت را تغییر می‌دهد؟</th></tr>
+    <tr><td><b>discover</b></td><td>MSL یک اپلت نصب‌شده را کشف می‌کند</td><td>نه (فقط کانتر OTA جلو می‌رود)</td></tr>
+    <tr><td><b>verify</b></td><td>یک MSL معلوم را اثبات می‌کند (PASS/FAIL)</td><td>نه</td></tr>
+    <tr><td><b>install</b></td><td>اپلت را با یک MSL مشخص نصب می‌کند</td><td><b>بله — برگشت‌ناپذیر</b></td></tr>
+  </table>
+
+  <h2 id="setup">آماده‌سازی در UL (یک‌بار)</h2>
+  <ol>
+    <li>کلاس‌ها در پوشهٔ خروجی UL مستقرند:
+        <code>C:\Users\user\OneDrive\Documents\TAR\Clases</code></li>
+    <li>در UL: <b>Tools → Options → Java → Class Path</b> روی همان پوشه باشد (ست شده).</li>
+    <li>اگر سورس را تازه ساخته‌ای، UL را <b>ببند و باز کن</b> تا کلاس‌های جدید لود شوند.</li>
+  </ol>
+  <div class="warn">
+    اگر موقع Compile در UL خطای <code>cannot find symbol: MslCore</code> دیدی،
+    یعنی Class Path خالی است — چون این پروژه چندفایلی است و اسکریپت به کلاس‌های
+    <code>lib/</code> ارجاع می‌دهد.
+  </div>
+
+  <h2 id="discover">کار ۱ — discover <span class="pill ok">امن / فقط خواندنی</span></h2>
+  <p>با این شروع کن. چیزی نصب یا حذف نمی‌کند.</p>
+  <ol class="step">
+    <li>اسکریپت <b>MslScript</b> را اجرا کن — دیالوگ می‌آید.
+        <b>تا تأیید نکنی هیچ بایتی به کارت نمی‌رود، حتی reset.</b></li>
+    <li>تب <b>Job</b>: گزینهٔ <code>discover</code>؛ برچسب کارت را بده (در گزارش می‌آید).</li>
+    <li>تب <b>OTA key set</b>: مقادیر کارت را وارد کن (جدول مرجع فیلدها را ببین).
+        مهم: <b>KID = کلید واقعی</b>، <b>KIc = خالی</b> وقتی برابرند.</li>
+    <li>تب <b>Probing</b>: budget = <code>16</code> و تیک
+        <b>«Card discards below-MSL packets silently»</b> را بزن (برای کارت MCI لازم است).</li>
+    <li>تب <b>Report</b>: یک پوشه با دکمهٔ <code>...</code> انتخاب کن (یا تیک گزارش را بردار).</li>
+    <li>تب <b>Run</b>: تیک «این مقادیر با سیم داخل ریدر می‌خوانند» → <b>Start run</b>.</li>
+  </ol>
+  <div class="good">
+    نتیجهٔ مورد انتظار برای USIM (<span class="hex">B00011</span>):
+    <code>MSL: 12 (cryptographic checksum, no ciphering, counter must be higher) — confirmed</code>
+  </div>
+  <p>بقیهٔ اپلت‌های محافظت‌شده را هم همین‌طور بزن (هر بار Start counter را کمی بالاتر بگذار):
+     ISIM <span class="hex">B00020</span>، HPSIM <span class="hex">B00021</span>،
+     RFM <span class="hex">B00010</span>، EAP <span class="hex">B00022</span>.</p>
+
+  <h2 id="verify">کار ۲ — verify <span class="pill ok">امن</span></h2>
+  <p>وقتی MSL را می‌دانی و می‌خواهی اثباتش کنی:</p>
+  <ol>
+    <li>تب <b>Job</b>: <code>verify</code>.</li>
+    <li>تب <b>Probing</b>: سه محور MSL ادعایی را از دراپ‌داون‌ها انتخاب کن
+        (برای <span class="hex">0x12</span>: Integrity=CRYPTOGRAPHIC_CHECKSUM،
+        Ciphering=OFF، Counter=PROCESS_IF_HIGHER). تیک silent-drop را هم بزن.</li>
+    <li>بقیه مثل discover.</li>
+  </ol>
+  <p><span class="pill ok">PASS</span> یعنی کارت دقیقاً همان MSL را اجبار می‌کند.
+     <span class="pill bad">FAIL</span> یعنی کارت کمتر یا بیشتر از ادعا اعمال می‌کند — و
+     «کمتر» همان چیزی است که باید نگرانش بود.</p>
+
+  <h2 id="install">کار ۳ — install <span class="pill bad">کارت را تغییر می‌دهد</span></h2>
+  <div class="warn">این کار اپلت نصب می‌کند و <b>برگشت‌ناپذیر</b> است. فقط وقتی لازم است که
+    بخواهی یک MSL جدید ست کنی. MSL را نمی‌شود در جا عوض کرد؛ باید instance را حذف و دوباره نصب کرد.</div>
+  <ol>
+    <li>تب‌های <b>GlobalPlatform</b> / <b>Applet</b> / <b>Minimum Security Level</b> را پر کن.</li>
+    <li>قالب پارامتر را انتخاب کن: <b>UICC</b> (<span class="hex">EA{80}</span>) یا
+        <b>SIM</b> (<span class="hex">EF{CA}</span>). برای این کارت‌های UICC، پیش‌فرض UICC درست است.</li>
+    <li><b>پیش‌نمایش بایت‌به‌بایت</b> پارامترها را قبل از Start بخوان — چون هیچ دستوری بعداً
+        آن را نمی‌خواند که اشتباه را بگیرد.</li>
+    <li>در تب Run، تیک دوم (پذیرش نصب) هم لازم است.</li>
+  </ol>
+
+  <h2 id="fields">مرجع فیلدها (کارت MCI / Hamrah)</h2>
+  <table>
+    <tr><th>فیلد</th><th>مقدار نمونه</th><th>توضیح</th></tr>
+    <tr><td>ISD AID</td><td class="hex">A000000151000000</td><td>بسته به پروفایل کارت؛ از دراپ‌داون انتخاب شود</td></tr>
+    <tr><td>Applet TAR</td><td class="hex">B00011</td><td>USIM؛ ISIM=B00020، HPSIM=B00021، RFM=B00010، EAP=B00022</td></tr>
+    <tr><td>Key version (KVN)</td><td class="hex">01</td><td>نسخهٔ key set OTA</td></tr>
+    <tr><td>Algorithm</td><td>3des2</td><td>3DES دو-کلیده (single DES پشتیبانی نمی‌شود)</td></tr>
+    <tr><td>KID key (integrity)</td><td>کلید واقعی</td><td>MAC را امضا می‌کند — همین برای probe لازم است</td></tr>
+    <tr><td>KIc key (ciphering)</td><td>خالی</td><td>فقط برای probe رمزشده؛ خالی = برابر KID</td></tr>
+    <tr><td>Start counter</td><td class="hex">600000</td><td><b>هگز</b>، و باید <b>بالای</b> کانتر فعلی کارت باشد</td></tr>
+    <tr><td>PoR mode / delivery</td><td>POR_REQUIRED / SMS_DELIVER_REPORT</td><td>پیش‌فرض</td></tr>
+    <tr><td>Terminal profile</td><td class="hex">02</td><td>باید فرستاده شود تا toolkit کارت بیدار شود</td></tr>
+    <tr><td>Silent-drop</td><td>روشن</td><td>این کارت زیر-MSL را بی‌صدا می‌اندازد، نه 0A</td></tr>
+  </table>
+  <div class="warn">
+    <b>کانتر هگز است.</b> «<span class="hex">300000</span>» یعنی <span class="hex">0x300000</span>
+    ≈ ۳٫۱ میلیون، نه سیصدهزار. اگر کانتر زیر مقدار فعلی کارت باشد، هیچ PoR برنمی‌گردد و همه‌چیز
+    مثل کلید اشتباه به‌نظر می‌رسد.
+  </div>
+
+  <h2 id="read">خواندن نتیجه</h2>
+  <ul>
+    <li><b>بلوک حکم</b> در لاگ و در گزارش: <span class="pill ok">PASS</span>،
+        <span class="pill bad">FAIL</span>، <span class="pill warn">UNCONFIRMED</span>،
+        یا <span class="pill warn">UNKNOWN</span>.</li>
+    <li><b>جدول پروب‌ها</b>: هر بسته با SPI1، امنیت اعمال‌شده، و نتیجه
+        (<span class="pill ok">ACCEPTED</span> / <span class="pill bad">BELOW_MSL</span> /
+        <span class="pill warn">INCONCLUSIVE</span>) و کد PoR.</li>
+    <li><b>گزارش HTML + CSV</b> در پوشهٔ انتخابی، با نام شامل برچسب کارت و زمان.</li>
+  </ul>
+  <p>در خط ماشین‌خوان:
+     <span class="ltr">MSL-RESULT|&lt;card&gt;|&lt;TAR&gt;|DISCOVER|PASS|MSL 12</span></p>
+
+  <h2 id="trouble">عیب‌یابی سریع</h2>
+  <table>
+    <tr><th>نشانه</th><th>معنی</th><th>کار</th></tr>
+    <tr><td>TERMINAL PROFILE=9000 ولی همه پروب‌ها no-PoR</td><td>کانتر زیر مقدار کارت</td><td>Start counter را بزرگ‌تر کن (هگز!)</td></tr>
+    <tr><td>همهٔ TARها (حتی ناموجود) no-PoR</td><td>کلید/MAC غلط یا کانتر پایین</td><td>KID و کانتر را چک کن</td></tr>
+    <tr><td>discover «undetermined» با وجود پاسخ سقف</td><td>تیک silent-drop نخورده</td><td>تیک silent-drop را بزن</td></tr>
+    <tr><td><code>cannot find symbol: MslCore</code></td><td>Class Path خالی</td><td>Class Path را روی پوشهٔ Clases بگذار</td></tr>
+    <tr><td>دیالوگ نمی‌آید</td><td>نسخهٔ قدیمی لودشده</td><td>UL را ببند و باز کن</td></tr>
+  </table>
+
+  <h2 id="safety">نکات امنیتی و صداقت</h2>
+  <ul>
+    <li><b>کلید در هیچ فایلی نوشته نمی‌شود</b> و در گزارش نمی‌آید — تست خودکار این را تضمین می‌کند.</li>
+    <li>discover <b>کانتر OTA کارت را جلو می‌برد</b> (اجتناب‌ناپذیر، بی‌ضرر).</li>
+    <li>این کارت <b>کلید واقعی لازم دارد</b>: بدون MAC معتبر هیچ PoR نمی‌دهد — یک سخت‌سازی خوب
+        که نمی‌گذارد کارت بدون کلید به «اوراکل MSL» تبدیل شود.</li>
+    <li>قبل از Start هیچ چیزی ارسال نشده؛ Cancel یعنی هیچ بایتی نرفته.</li>
+  </ul>
+
+  <footer>
+    MSL Checking — UL Mobile Card Test Platform 3.8.0 · مستند مطابق ETSI TS 102 225/226 و GlobalPlatform
+  </footer>
+</div>
+</body>
+</html>

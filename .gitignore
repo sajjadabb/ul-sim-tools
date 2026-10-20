@@ -1,0 +1,18 @@
+# build artifacts
+build/
+app/build/
+app/*.exe
+*.class
+
+# python caches / test scratch
+__pycache__/
+*.pyc
+tools/_syn.cap
+
+# generated, card-specific run outputs (regenerable; may contain card details)
+reports/
+
+# local secrets (never commit; keys are runtime-only)
+config/msl.properties
+*.key
+report/
