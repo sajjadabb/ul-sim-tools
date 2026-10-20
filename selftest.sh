@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Card-free checks over the MSL logic, both implementations. No reader, no card,
 # no dongle. Run this before you need any of them.
+#
+# Expected: Java 390, Python 397, UI 38, capload 22 (26 with the operator's real
+# CAP present), RAM end-to-end 68. The Python counts assume pycryptodomex:
+# without it the packet builder checks and the whole end-to-end suite are
+# skipped, and each prints a smaller number and says so.
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -37,6 +42,15 @@ if command -v python >/dev/null 2>&1; then
   echo
   echo "=== Python CAP loader (tools/capload.py) ==="
   python tools/selftest_capload.py || status=1
+
+  echo
+  echo "=== End to end over a simulated card (browse, delete, ota-install) ==="
+  # Nothing in msl_tool.py is mocked here: pyscard is replaced by a card that
+  # unwraps the envelope and the secured packet, executes the APDU inside it
+  # like a card manager - SHA-1 of the reassembled load file included - and
+  # answers with a response packet behind 61xx. It is the only test that
+  # exercises the loop rather than the pieces.
+  python tools/selftest_ram.py || status=1
 else
   echo "python not on PATH - skipped" >&2
 fi

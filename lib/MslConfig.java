@@ -23,15 +23,53 @@ public final class MslConfig
     public static final int MODE_VERIFY = 1;
     public static final int MODE_DISCOVER = 2;
     public static final int MODE_INSTALL = 3;
+    public static final int MODE_OTA_INSTALL = 4;
+    public static final int MODE_BROWSE = 5;
+    public static final int MODE_DELETE = 6;
+
+    /** Which road a card content management job takes to the card. */
+    public static final int TRANSPORT_OTA = 0;      // secured packets to the card manager TAR
+    public static final int TRANSPORT_ISD = 1;      // an SCP02 secure channel over the contact
 
     /**
-     * Which of the three jobs this run does.
+     * Which of the jobs this run does.
      *
      * The mode, not the scope, is what decides which values a run needs. There
      * is one script now - card content management and OTA probing in the same
      * class - so a fixed scope per script no longer exists to branch on.
      */
     public static boolean isInstall(int mode) { return mode == MODE_INSTALL; }
+
+    /**
+     * True for a job that changes what is on the card and cannot be undone.
+     *
+     * The dialog requires a second, separate acknowledgement for every one of
+     * these, and the scripts refuse to send until it is given. Probing and
+     * browsing are not here: they move the OTA counter (probing) or read the
+     * registry (browsing), and neither installs, deletes or overwrites.
+     */
+    public static boolean changesCard(int mode)
+    {
+        return mode == MODE_INSTALL || mode == MODE_OTA_INSTALL || mode == MODE_DELETE;
+    }
+
+    /** True for a job that talks to the card over OTA rather than through SCP02. */
+    public boolean usesOta()
+    {
+        if (mode == MODE_DISCOVER || mode == MODE_VERIFY || mode == MODE_OTA_INSTALL)
+        {
+            return true;
+        }
+        return (mode == MODE_BROWSE || mode == MODE_DELETE) && transport == TRANSPORT_OTA;
+    }
+
+    /** True for a job that opens an SCP02 secure channel to the ISD. */
+    public boolean usesSecureChannel()
+    {
+        if (mode == MODE_INSTALL) { return true; }
+
+        return (mode == MODE_BROWSE || mode == MODE_DELETE) && transport == TRANSPORT_ISD;
+    }
 
     private final int scope;
 
@@ -79,6 +117,65 @@ public final class MslConfig
     public int maxChannels = 0x00;
     public byte[] rawInstallParameters;          // non-null: use verbatim, skip the builder
     public int installFormat = MslCore.FORMAT_UICC;   // EA{80} UICC vs EF{CA} SIM (TS 102 226)
+
+    // -- OTA card content management (RAM) -------------------------------
+
+    /**
+     * The card manager's TAR, which is where a secured packet carrying an
+     * INSTALL, a GET STATUS or a DELETE has to be addressed.
+     *
+     * 000000 on every card this tool has met, and confirmed reachable on the
+     * MCI/Hamrah card with the KVN 01 key set (GET STATUS answered PoR 00). It
+     * is still a field rather than a constant because it is issuer-assigned
+     * like any other TAR.
+     */
+    public byte[] ramTar = new byte[] { 0x00, 0x00, 0x00 };
+
+    /**
+     * Bytes of load file per LOAD command.
+     *
+     * Over OTA every APDU has to fit one SMS-PP envelope once the secured
+     * packet, the UDH, the TPDU and the CAT envelope are wrapped around it, so
+     * this is far below the 255 a contact channel allows. Raising it past
+     * MslCapLoad.MAX_OTA_APDU does not make the load faster, it makes the
+     * packets undeliverable.
+     */
+    public int loadBlockSize = MslCapLoad.DEFAULT_BLOCK_SIZE;
+
+    /**
+     * Install the applet with empty application parameters and no toolkit block.
+     *
+     * A plain Java Card applet - one extending javacard.framework.Applet rather
+     * than being a toolkit application - has no MSL and no TAR, and a card
+     * rejects a toolkit block it has no business with. The operator's
+     * MobilePaymentApplet is exactly this case.
+     */
+    public boolean plainApplet;
+
+    /** OTA or SCP02, for browse and delete. Install is SCP02; ota-install is OTA. */
+    public int transport = TRANSPORT_OTA;
+
+    // -- browse ----------------------------------------------------------
+
+    public boolean browseApplications = true;      // GET STATUS P1 40
+    public boolean browseLoadFiles = true;         // GET STATUS P1 10, with modules
+    public boolean browseIssuerSecurityDomain;     // GET STATUS P1 80
+
+    // -- delete ----------------------------------------------------------
+
+    public byte[] deleteAid = new byte[0];
+
+    /**
+     * DELETE with P2 80 - the object and every object related to it.
+     *
+     * For a package that still has instances this is the only thing that works,
+     * and it takes those instances with it. Off by default, and the script
+     * lists what it is about to remove before it sends.
+     */
+    public boolean deleteRelatedObjects;
+
+    /** The operator's explicit go-ahead for an irreversible job. */
+    public boolean confirmIrreversible;
 
     // -- probing: the OTA key set ---------------------------------------
     public byte[] targetTar = new byte[0];
@@ -162,7 +259,53 @@ public final class MslConfig
         {
             return rawInstallParameters;
         }
+        if (plainApplet)
+        {
+            // Just the mandatory empty C9: no toolkit block, because a plain
+            // applet has no MSL and no TAR, and a card asked to accept a
+            // toolkit block for one answers 6A80.
+            return MslCore.buildInstallParameters(null, null, null, installFormat);
+        }
         return MslCore.buildInstallParameters(toolkit(), null, null, installFormat);
+    }
+
+    /**
+     * The security every RAM packet in a run is built at: cryptographic
+     * checksum, no ciphering, counter higher.
+     *
+     * Not configurable, and deliberately so. A RAM packet carries a real card
+     * content management command, so unlike a probe it has to be a packet the
+     * card will actually act on: no integrity means no MAC to authenticate the
+     * command manager with, and the card manager's own MSL would reject it.
+     * The counter policy follows the operator's one-higher choice only because
+     * that is the same decision the probing jobs make.
+     */
+    public MslProbing.Probe ramProbe()
+    {
+        return new MslProbing.Probe(MslCore.INTEGRITY_CC, MslCore.CIPHER_OFF,
+            allowOneHigher ? MslCore.COUNTER_ONE_HIGHER : MslCore.COUNTER_HIGHER);
+    }
+
+    /** The GET STATUS scopes a browse run should ask for, in order. */
+    public List browseScopes()
+    {
+        List scopes = new ArrayList();
+        if (browseIssuerSecurityDomain)
+        {
+            scopes.add(Integer.valueOf(MslCore.STATUS_ISSUER_SECURITY_DOMAIN));
+        }
+        if (browseApplications)
+        {
+            scopes.add(Integer.valueOf(MslCore.STATUS_APPLICATIONS));
+        }
+        if (browseLoadFiles)
+        {
+            // P1 10 rather than 20: the same load files, plus the module AIDs
+            // inside each - and the module AID is exactly what an INSTALL needs
+            // and what nobody can read off a CAP they do not have.
+            scopes.add(Integer.valueOf(MslCore.STATUS_LOAD_FILES_AND_MODULES));
+        }
+        return scopes;
     }
 
     public List validate()
@@ -189,30 +332,49 @@ public final class MslConfig
             }
         }
 
-        if (mode == MODE_INSTALL)
-        {
-            validateInstall(problems);
-        }
-        else
-        {
-            validateProbe(problems);
-        }
+        if (mode == MODE_INSTALL)          { validateInstall(problems); }
+        else if (mode == MODE_OTA_INSTALL) { validateOtaInstall(problems); }
+        else if (mode == MODE_BROWSE)      { validateBrowse(problems); }
+        else if (mode == MODE_DELETE)      { validateDelete(problems); }
+        else                               { validateProbe(problems); }
+
         return problems;
     }
 
     private void validateInstall(List problems)
     {
-        if (isdAid.length < 5) { problems.add("The ISD AID is required (5 to 16 bytes)."); }
-        if (scp02Enc.length != 16) { problems.add("The SCP02 ENC key must be 16 bytes."); }
-        if (scp02Mac.length != 16) { problems.add("The SCP02 MAC key must be 16 bytes."); }
-        if (scp02Dek.length != 16) { problems.add("The SCP02 DEK key must be 16 bytes."); }
+        validateSecureChannel(problems);
 
         if (loadFileAid.length < 5) { problems.add("The executable load file AID is required."); }
         if (moduleAid.length < 5) { problems.add("The executable module AID is required."); }
         if (instanceAid.length < 5) { problems.add("The application instance AID is required."); }
+        validatePrivileges(problems);
+        validateInstallParameters(problems);
+    }
+
+    private void validateSecureChannel(List problems)
+    {
+        if (isdAid.length < 5) { problems.add("The ISD AID is required (5 to 16 bytes)."); }
+        if (scp02Enc.length != 16) { problems.add("The SCP02 ENC key must be 16 bytes."); }
+        if (scp02Mac.length != 16) { problems.add("The SCP02 MAC key must be 16 bytes."); }
+        if (scp02Dek.length != 16) { problems.add("The SCP02 DEK key must be 16 bytes."); }
+    }
+
+    private void validatePrivileges(List problems)
+    {
         if (privileges.length != 1 && privileges.length != 3)
         {
             problems.add("Privileges are 1 byte (GlobalPlatform 2.1) or 3 bytes (2.2+).");
+        }
+    }
+
+    private void validateInstallParameters(List problems)
+    {
+        if (plainApplet && (rawInstallParameters == null || rawInstallParameters.length == 0))
+        {
+            // A plain applet installs with the mandatory empty C9 and nothing
+            // else, so there is no MSL and no TAR to check for.
+            return;
         }
 
         if (rawInstallParameters == null || rawInstallParameters.length == 0)
@@ -261,6 +423,33 @@ public final class MslConfig
     private void validateProbe(List problems)
     {
         if (targetTar.length != 3) { problems.add("The target TAR is exactly 3 bytes."); }
+        validateOtaKeySet(problems);
+
+        if (mode == MODE_VERIFY && claimedMsl == null)
+        {
+            problems.add("Verifying needs the MSL the applet is supposed to have. If you do not "
+                         + "know it, run in discover mode instead.");
+        }
+        if (probeBudget < 4)
+        {
+            problems.add("A probe budget below 4 cannot complete even the shortest walk.");
+        }
+        if (allowCiphering && effectiveKicKey().length == 0)
+        {
+            problems.add("Ciphered probes need the KIc key (fill KIc, or KID when they are equal).");
+        }
+    }
+
+    /**
+     * The key set, counter and PoR policy every OTA job needs, whatever it then
+     * does with the packet.
+     *
+     * Shared by probing, ota-install and the OTA road into browse and delete:
+     * the packet is built identically for all of them, so a key or counter that
+     * would sink a probe sinks a RAM command for exactly the same reason.
+     */
+    private void validateOtaKeySet(List problems)
+    {
         if (otaKey.length == 0) { problems.add("The OTA KIc/KID key value is required."); }
 
         int expected = "des".equals(otaAlgorithm) ? 8 : ("3des3".equals(otaAlgorithm) ? 24 : 16);
@@ -296,20 +485,89 @@ public final class MslConfig
                          + "read until the PoR is deciphered, which this tool does not do - clear "
                          + "bit b5.");
         }
+    }
 
-        if (mode == MODE_VERIFY && claimedMsl == null)
+    /**
+     * ota-install: load a CAP and install from it, all over OTA.
+     *
+     * The load file AID is NOT asked for here - it is read out of the CAP's own
+     * Header component, and MslScript cross-checks that reading against the
+     * SDK's LoadSequence before it sends anything. Asking the operator to retype
+     * an AID the file already carries would only create a way for the two to
+     * disagree.
+     */
+    private void validateOtaInstall(List problems)
+    {
+        if (capPath == null || capPath.trim().length() == 0)
         {
-            problems.add("Verifying needs the MSL the applet is supposed to have. If you do not "
-                         + "know it, run in discover mode instead.");
+            problems.add("Name the CAP file to load: ota-install loads the package and installs "
+                         + "from it in one run, so there is nothing to install without one.");
         }
-        if (probeBudget < 4)
+        else if (!new java.io.File(capPath.trim()).isFile())
         {
-            problems.add("A probe budget below 4 cannot complete even the shortest walk.");
+            problems.add("No CAP file at " + capPath.trim());
         }
-        if (allowCiphering && effectiveKicKey().length == 0)
+
+        if (moduleAid.length < 5)
         {
-            problems.add("Ciphered probes need the KIc key (fill KIc, or KID when they are equal).");
+            problems.add("The executable module AID is required. The CAP's Applet component "
+                         + "declares it - the run prints every AID it finds before it sends.");
         }
+        if (instanceAid.length < 5) { problems.add("The application instance AID is required."); }
+        validatePrivileges(problems);
+        validateInstallParameters(problems);
+
+        if (ramTar.length != 3)
+        {
+            problems.add("The card manager TAR is exactly 3 bytes (000000 on every card this "
+                         + "tool has met).");
+        }
+        if (loadBlockSize < 16 || loadBlockSize > MslCapLoad.MAX_OTA_APDU - 5)
+        {
+            problems.add("The LOAD block size must be between 16 and "
+                         + (MslCapLoad.MAX_OTA_APDU - 5) + " bytes: above that the secured packet "
+                         + "no longer fits a single SMS-PP envelope and the card never sees it.");
+        }
+        validateOtaKeySet(problems);
+    }
+
+    /** browse: read the registry. Read-only on either road. */
+    private void validateBrowse(List problems)
+    {
+        if (!browseApplications && !browseLoadFiles && !browseIssuerSecurityDomain)
+        {
+            problems.add("Choose at least one thing to list - applications, load files, or the "
+                         + "issuer security domain.");
+        }
+        validateContentManagementTransport(problems);
+    }
+
+    /** delete: remove an instance or a package. Irreversible on either road. */
+    private void validateDelete(List problems)
+    {
+        if (deleteAid.length < 5 || deleteAid.length > 16)
+        {
+            problems.add("The AID to delete is required (5 to 16 bytes). Run the browse job first "
+                         + "if you are not certain of it - a DELETE sent at the wrong AID is not "
+                         + "undone by noticing afterwards.");
+        }
+        validateContentManagementTransport(problems);
+    }
+
+    private void validateContentManagementTransport(List problems)
+    {
+        if (transport == TRANSPORT_ISD)
+        {
+            validateSecureChannel(problems);
+            return;
+        }
+
+        if (ramTar.length != 3)
+        {
+            problems.add("The card manager TAR is exactly 3 bytes (000000 on every card this "
+                         + "tool has met).");
+        }
+        validateOtaKeySet(problems);
     }
 
     /** A one-line summary for the certificate. Never includes key material. */
@@ -326,6 +584,43 @@ public final class MslConfig
             text.append(", instance=").append(MslCore.hex(instanceAid));
             text.append(", MSL=").append(msl == null ? "none" : msl.describe());
             text.append(", install parameters=").append(MslCore.hex(installParameters()));
+        }
+        else if (mode == MODE_OTA_INSTALL)
+        {
+            text.append(", job=ota-install over RAM TAR=").append(MslCore.hex(ramTar));
+            text.append(", key set KVN=").append(MslCore.hexByte(otaKvn));
+            text.append(" ").append(otaAlgorithm);
+            text.append(", CAP=").append(capPath);
+            text.append(", instance=").append(MslCore.hex(instanceAid));
+            text.append(", module=").append(MslCore.hex(moduleAid));
+            text.append(", LOAD block=").append(loadBlockSize);
+            text.append(plainApplet ? ", plain applet (empty C9)"
+                                    : ", MSL=" + (msl == null ? "none" : msl.describe()));
+            text.append(", install parameters=").append(MslCore.hex(installParameters()));
+        }
+        else if (mode == MODE_BROWSE || mode == MODE_DELETE)
+        {
+            text.append(", job=").append(mode == MODE_BROWSE ? "browse" : "delete");
+            if (transport == TRANSPORT_ISD)
+            {
+                text.append(" over SCP02, ISD=").append(MslCore.hex(isdAid));
+                text.append(", KVN=").append(MslCore.hexByte(scp02Kvn));
+            }
+            else
+            {
+                text.append(" over RAM, TAR=").append(MslCore.hex(ramTar));
+                text.append(", key set KVN=").append(MslCore.hexByte(otaKvn));
+                text.append(" ").append(otaAlgorithm);
+            }
+            if (mode == MODE_DELETE)
+            {
+                text.append(", AID=").append(MslCore.hex(deleteAid));
+                text.append(deleteRelatedObjects ? ", WITH related objects" : ", that object only");
+            }
+            else
+            {
+                text.append(", scopes=").append(browseScopes().size());
+            }
         }
         else
         {

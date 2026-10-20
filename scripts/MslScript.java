@@ -27,6 +27,7 @@ import java.awt.Frame;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -70,8 +71,11 @@ public class MslScript extends SCP02Script
 
     private String jobName()
     {
-        if (cfg.mode == MslConfig.MODE_INSTALL)  { return "install"; }
-        if (cfg.mode == MslConfig.MODE_VERIFY)   { return "verify"; }
+        if (cfg.mode == MslConfig.MODE_INSTALL)     { return "install"; }
+        if (cfg.mode == MslConfig.MODE_OTA_INSTALL) { return "ota-install"; }
+        if (cfg.mode == MslConfig.MODE_BROWSE)      { return "browse"; }
+        if (cfg.mode == MslConfig.MODE_DELETE)      { return "delete"; }
+        if (cfg.mode == MslConfig.MODE_VERIFY)      { return "verify"; }
         return "discover";
     }
 
@@ -109,14 +113,11 @@ public class MslScript extends SCP02Script
 
         try
         {
-            if (cfg.mode == MslConfig.MODE_INSTALL)
-            {
-                install();
-            }
-            else
-            {
-                probe();
-            }
+            if (cfg.mode == MslConfig.MODE_INSTALL)          { install(); }
+            else if (cfg.mode == MslConfig.MODE_OTA_INSTALL) { otaInstall(); }
+            else if (cfg.mode == MslConfig.MODE_BROWSE)      { browse(); }
+            else if (cfg.mode == MslConfig.MODE_DELETE)      { deleteObject(); }
+            else                                             { probe(); }
         }
         catch (MslProbing.BudgetExhausted stop)
         {
@@ -536,6 +537,735 @@ public class MslScript extends SCP02Script
         return MslCore.hexByte(status >> 8) + MslCore.hexByte(status);
     }
 
+    // ==================================================================
+    // ota-install - load a CAP and install from it, all over OTA
+    // ==================================================================
+
+    /**
+     * Card content management over Remote Application Management: INSTALL [for
+     * load], the LOAD chain and INSTALL [for install] each wrapped in its own
+     * SCP80 secured packet addressed to the card manager's TAR.
+     *
+     * This is the Java side of what tools/msl_tool.py does with `ota-install`,
+     * and it is deliberately the same shape: build everything, print everything,
+     * send nothing unless the operator has ticked the irreversible box.
+     *
+     * The serialization question - whether the load file this tool builds is the
+     * load file the card should get - is not answered by trusting MslCapLoad. It
+     * is answered by asking the SDK's own LoadSequence for the same CAP's load
+     * file AID and SHA-1, and refusing to send if either disagrees. A matching
+     * hash over the whole load file means the concatenation is byte-identical to
+     * the SDK's, which is the one thing that has to be exactly right here.
+     */
+    private void otaInstall()
+    {
+        File cap = new File(cfg.capPath.trim());
+
+        out.heading("Reading " + cap.getName());
+        MslCapLoad.Sequence sequence;
+        try
+        {
+            sequence = MslCapLoad.read(cap, cfg.loadBlockSize);
+        }
+        catch (IOException e)
+        {
+            out.error("Could not read the CAP: " + e.getMessage());
+            record(MslReport.FAIL, "the CAP could not be read", e.getMessage());
+            return;
+        }
+        catch (RuntimeException e)
+        {
+            out.error("The CAP does not read as a Java Card archive: " + e.getMessage());
+            record(MslReport.FAIL, "the CAP does not parse", e.getMessage());
+            return;
+        }
+
+        out.info("load file (ELF) AID : " + MslCore.hex(sequence.elfAid));
+        for (int i = 0; i < sequence.appletAids.size(); i++)
+        {
+            out.info("applet AID declared : "
+                     + MslCore.hex((byte[]) sequence.appletAids.get(i)));
+        }
+        out.info("load file size      : " + sequence.loadFile.length + " bytes");
+        out.info("load file SHA-1     : " + MslCore.hex(sequence.loadFileHash));
+        out.info("LOAD blocks         : " + (sequence.apdus.size() - 1) + " of up to "
+                 + cfg.loadBlockSize + " bytes");
+
+        boolean sdkAgrees = sdkConfirmsLoadFile(sequence);
+
+        // The install parameters, said back from the bytes rather than from the
+        // dialog - the same read-back the contact install does, for the same
+        // reason: nothing on the card reads them afterwards.
+        byte[] parameters = cfg.installParameters();
+        out.heading("What will be installed");
+        out.info("module AID        : " + MslCore.hex(cfg.moduleAid));
+        out.info("instance AID      : " + MslCore.hex(cfg.instanceAid));
+        out.info("privileges        : " + MslCore.hex(cfg.privileges));
+        out.info("install parameters: " + MslCore.hex(parameters));
+        out.lines(MslCore.describeInstallParameters(parameters));
+
+        MslCore.Level readBack;
+        try
+        {
+            readBack = MslCore.mslOfInstallParameters(parameters);
+        }
+        catch (RuntimeException e)
+        {
+            out.error("The install parameters do not parse back: " + e.getMessage());
+            record(MslReport.FAIL, "the install parameters do not parse back", e.getMessage());
+            return;
+        }
+        out.info("MSL encoded in those bytes: "
+                 + (readBack == null ? "none - this applet will enforce no minimum"
+                                     : readBack.describe()));
+
+        byte[] installApdu = MslCore.buildInstallApdu(sequence.elfAid, cfg.moduleAid,
+                                                      cfg.instanceAid, cfg.privileges, parameters,
+                                                      cfg.makeSelectable);
+
+        List names = new ArrayList(sequence.names);
+        List apdus = new ArrayList(sequence.apdus);
+        names.add("INSTALL [for install" + (cfg.makeSelectable ? " and make selectable" : "") + "]");
+        apdus.add(installApdu);
+
+        out.heading("The " + apdus.size() + " packets this job would send");
+        for (int i = 0; i < apdus.size(); i++)
+        {
+            byte[] apdu = (byte[]) apdus.get(i);
+            String line = pad(String.valueOf(names.get(i)), 34) + " " + MslCore.hex(apdu);
+            out.step(line);
+            report.installLine(line);
+        }
+
+        // An APDU that cannot fit one envelope is not a card problem, it is this
+        // run's problem, and it is caught here rather than at packet 40 of 60.
+        byte[] oversized = null;
+        for (int i = 0; i < apdus.size(); i++)
+        {
+            if (!MslCapLoad.fitsOneEnvelope((byte[]) apdus.get(i)))
+            {
+                oversized = (byte[]) apdus.get(i);
+                break;
+            }
+        }
+        if (oversized != null)
+        {
+            out.error("One APDU is " + oversized.length + " bytes, above the "
+                      + MslCapLoad.MAX_OTA_APDU + " a single SMS-PP envelope can carry. Lower the "
+                      + "LOAD block size; if it is the INSTALL itself, shorten the install "
+                      + "parameters.");
+            record(MslReport.FAIL, "an APDU does not fit one envelope",
+                   "Nothing was sent. " + oversized.length + " bytes against a limit of "
+                   + MslCapLoad.MAX_OTA_APDU + ".");
+            return;
+        }
+
+        if (!cfg.confirmIrreversible)
+        {
+            out.heading("Dry run");
+            out.info("Nothing was sent. Every packet above was built, and the load file was "
+                     + (sdkAgrees ? "confirmed against the SDK's own reading of this CAP."
+                                  : "NOT confirmed against the SDK - see the warning above."));
+            out.info("Tick the irreversible-change box on the Run tab to actually load and "
+                     + "install. Prefer a disposable test card: this cannot be undone.");
+            record(MslReport.UNKNOWN, "dry run - nothing was sent",
+                   "The " + apdus.size() + " packets above were built and printed. No card "
+                   + "content was changed.");
+            return;
+        }
+
+        if (!sdkAgrees)
+        {
+            out.error("Refusing to send: this tool's load file does not match the SDK's reading of "
+                      + "the same CAP. One of the two is wrong, and an irreversible load is not "
+                      + "the place to find out which.");
+            record(MslReport.FAIL, "the load file disagrees with the SDK",
+                   "Nothing was sent. The dry run above shows both readings.");
+            return;
+        }
+
+        reset();
+        wakeToolkit();
+
+        Sender sender = new Sender(cfg.ramTar);
+        out.heading("Sending " + apdus.size() + " secured packets to card manager TAR "
+                    + MslCore.hex(cfg.ramTar));
+
+        for (int i = 0; i < apdus.size(); i++)
+        {
+            String name = String.valueOf(names.get(i));
+            Ram step = sender.exchange((byte[]) apdus.get(i));
+
+            if (!step.packetAccepted())
+            {
+                out.error("STOPPED at " + name + ": " + step.describe());
+                out.info(step.por == null
+                    ? "No PoR at all. On this card family that is a counter below the card's, a "
+                      + "wrong card manager key, or a TAR that is not the card manager."
+                    : "The packet itself was refused, so the command inside it never ran.");
+                record(MslReport.FAIL, "stopped at " + name, step.describe()
+                       + ". The card may now hold a partly loaded package: delete the load file "
+                       + "with the delete job before trying again, or the next INSTALL [for load] "
+                       + "answers 6A80.");
+                return;
+            }
+            if (step.inner == null)
+            {
+                out.warn(name + ": PoR 00, but the response carried no status word for the command "
+                         + "inside it - so the card accepted the packet and this run cannot prove "
+                         + "the command itself worked. Stopping rather than loading on top of it.");
+                record(MslReport.UNCONFIRMED, "no inner status word at " + name,
+                       "PoR 00 says the packet was accepted; it says nothing about the command.");
+                return;
+            }
+            if (!step.inner.ok())
+            {
+                out.error("STOPPED at " + name + ": the card manager answered "
+                          + MslCore.hexWord(step.inner.statusWord));
+                explainInstallFailure(step.inner.statusWord);
+                record(MslReport.FAIL, name + " answered "
+                       + MslCore.hexWord(step.inner.statusWord),
+                       "The packet was accepted (PoR 00) and the command inside it was refused.");
+                return;
+            }
+            out.good(pad(name, 34) + " PoR 00, card SW "
+                     + MslCore.hexWord(step.inner.statusWord));
+        }
+
+        out.heading("Registry check");
+        boolean present = ramRegistryHolds(sender, MslCore.STATUS_APPLICATIONS, cfg.instanceAid);
+
+        out.heading("What is proven, and what is not");
+        out.info("Every packet was accepted and every command answered 9000. That means the card "
+                 + "loaded the package and created the instance. It does NOT mean the MSL inside "
+                 + "the parameters is enforced as it reads - nothing reads install parameters "
+                 + "back, so run the discover or verify job against the applet's TAR next.");
+
+        record(present ? MslReport.PASS : MslReport.UNCONFIRMED,
+               "loaded and installed " + MslCore.hex(cfg.instanceAid)
+               + (readBack == null ? " with no MSL field"
+                                   : " with MSL " + MslCore.hexByte(readBack.toByte())),
+               present
+                   ? "9000 on every step, and the instance is in the registry. The MSL is still "
+                     + "only a claim until the verify job demonstrates it."
+                   : "9000 on every step, but the registry read afterwards did not show the "
+                     + "instance. Treat the install as unconfirmed and browse the card.");
+    }
+
+    /**
+     * Asks the SDK the same two questions about this CAP and compares.
+     *
+     * Both answers are printed whichever way it goes, because that is what
+     * makes a disagreement diagnosable rather than just fatal. A missing or
+     * empty SDK hash counts as a disagreement: it means the cross-check did not
+     * happen, and an unchecked load file is exactly what this method exists to
+     * refuse.
+     */
+    private boolean sdkConfirmsLoadFile(MslCapLoad.Sequence sequence)
+    {
+        out.heading("Cross-checking the load file against the SDK");
+
+        LoadSequence sdk;
+        try
+        {
+            sdk = new LoadSequence(cfg.capPath);
+        }
+        catch (Exception e)
+        {
+            out.warn("The SDK's LoadSequence could not read this CAP: " + e.getMessage()
+                     + " - so this tool's reading of it is unchecked.");
+            return false;
+        }
+
+        byte[] sdkAid;
+        byte[] sdkHash;
+        try
+        {
+            sdkAid = sdk.getLoadFileAID();
+            sdkHash = sdk.getLoadFileDataBlockHash();
+        }
+        catch (RuntimeException e)
+        {
+            out.warn("The SDK would not say what it thinks this CAP's load file is: "
+                     + e.getMessage());
+            return false;
+        }
+
+        out.info("SDK load file AID   : " + MslCore.hex(sdkAid));
+        out.info("SDK load file SHA-1 : " + MslCore.hex(sdkHash));
+
+        if (sdkHash == null || sdkHash.length == 0)
+        {
+            out.warn("The SDK returned no load file hash, so there is nothing to compare this "
+                     + "tool's load file against.");
+            return false;
+        }
+        if (!MslCore.equal(sdkAid, sequence.elfAid))
+        {
+            out.error("The load file AID disagrees: this tool reads "
+                      + MslCore.hex(sequence.elfAid) + " from the Header component, the SDK says "
+                      + MslCore.hex(sdkAid) + ".");
+            return false;
+        }
+        if (!MslCore.equal(sdkHash, sequence.loadFileHash))
+        {
+            out.error("The load file data block disagrees: same CAP, different SHA-1. The two "
+                      + "readings differ somewhere in the component concatenation, and the card "
+                      + "would be sent a load file whose hash does not match its own INSTALL "
+                      + "[for load].");
+            return false;
+        }
+
+        out.good("the SDK agrees: same load file AID, same SHA-1 over the whole load file");
+        return true;
+    }
+
+    // ==================================================================
+    // browse - what is actually on this card
+    // ==================================================================
+
+    /**
+     * GET STATUS, over either road, read-only.
+     *
+     * Read-only is the whole point: the operator's question is "what is on this
+     * card, and what is its AID" - usually before an install or a delete - and
+     * the answer must not cost the card anything. Over OTA it does cost the OTA
+     * counter one step per scope, which is unavoidable and reported.
+     */
+    private void browse()
+    {
+        List scopes = cfg.browseScopes();
+
+        if (cfg.transport == MslConfig.TRANSPORT_ISD)
+        {
+            if (!openSession()) { return; }
+
+            int found = 0;
+            for (int i = 0; i < scopes.size(); i++)
+            {
+                found += listOverSecureChannel(((Integer) scopes.get(i)).intValue());
+            }
+            recordBrowse(found);
+            return;
+        }
+
+        reset();
+        wakeToolkit();
+
+        Sender sender = new Sender(cfg.ramTar);
+        int found = 0;
+        for (int i = 0; i < scopes.size(); i++)
+        {
+            found += listOverRam(sender, ((Integer) scopes.get(i)).intValue());
+        }
+
+        out.heading("Counter");
+        out.info("This run sent " + sender.sent + " packet(s). The last PoR reported "
+                 + (sender.lastCardCounter == null ? "no counter value"
+                                                   : MslCore.hex(sender.lastCardCounter))
+                 + "; start the next run above that.");
+        recordBrowse(found);
+    }
+
+    private void recordBrowse(int found)
+    {
+        record(found > 0 ? MslReport.PASS : MslReport.UNKNOWN,
+               found > 0 ? found + " registry entr" + (found == 1 ? "y" : "ies") + " listed"
+                         : "no registry entries were listed",
+               found > 0
+                   ? "Read-only: nothing on the card was changed."
+                   : "Either the card refused GET STATUS, or the answer did not parse as a "
+                     + "registry. Read the log: a PoR status other than 00 means the packet "
+                     + "never reached the card manager.");
+    }
+
+    /**
+     * One GET STATUS scope over OTA, following the card's 6310 continuations.
+     *
+     * 6310 is "there is more, ask again" - P2 bit b1 set. Each continuation is
+     * another packet and another counter step, so the walk is bounded: a card
+     * that answers 6310 forever would otherwise empty the counter space.
+     */
+    private int listOverRam(Sender sender, int scope)
+    {
+        out.heading("GET STATUS - " + MslCore.statusScopeLabel(scope) + " (over RAM)");
+
+        int total = 0;
+        boolean next = false;
+
+        for (int round = 0; round < 8; round++)
+        {
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, new byte[0], next, false);
+            out.step("sending " + MslCore.hex(apdu));
+
+            Ram answer = sender.exchange(apdu);
+            if (!answer.packetAccepted())
+            {
+                out.error(answer.describe());
+                return total;
+            }
+            if (answer.inner == null)
+            {
+                out.warn("PoR 00 with no response data: the card manager executed nothing this "
+                         + "run can read. A card that answers this to GET STATUS is usually "
+                         + "refusing card content management to this key set.");
+                return total;
+            }
+
+            int status = answer.inner.statusWord;
+            if (status != 0x9000 && status != 0x6310)
+            {
+                out.error("the card manager answered " + MslCore.hexWord(status)
+                          + " to GET STATUS");
+                if (status == 0x6A88)
+                {
+                    out.info("6A88 here means the card has nothing in this scope - an empty "
+                             + "registry section, not an error.");
+                }
+                return total;
+            }
+
+            total += printRegistry(answer.inner.data, scope);
+
+            if (status != 0x6310) { return total; }
+
+            out.info("6310: the card has more entries in this scope, asking for the next ones");
+            next = true;
+        }
+
+        out.warn("stopped after 8 continuations - the card kept saying 6310. The listing above is "
+                 + "incomplete.");
+        return total;
+    }
+
+    /**
+     * One GET STATUS scope through the SCP02 secure channel.
+     *
+     * The two scopes the SDK's own StatusType names are the ones this script has
+     * always used, and they go through the SDK's sequence - which handles the
+     * 6310 chaining itself. The issuer security domain scope has no proven
+     * constant here, so it goes as an APDU built by MslCore and parsed by it
+     * too; if a card answers nothing to that, the log says so rather than the
+     * run pretending the ISD is absent.
+     */
+    private int listOverSecureChannel(int scope)
+    {
+        out.heading("GET STATUS - " + MslCore.statusScopeLabel(scope) + " (over SCP02)");
+
+        if (scope == MslCore.STATUS_ISSUER_SECURITY_DOMAIN)
+        {
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, new byte[0], false, false);
+            GenericISOCommand command = new GenericISOCommand("GET STATUS");
+            command.cla(apdu[0] & 0xFF).ins(apdu[1] & 0xFF).p1(apdu[2] & 0xFF).p2(apdu[3] & 0xFF);
+
+            byte[] data = new byte[apdu[4] & 0xFF];
+            System.arraycopy(apdu, 5, data, 0, data.length);
+            command.data(data).le(0x00);
+
+            ISOResponse response = sendSecure(command);
+            int status = response.getStatusWord();
+            if (status != 0x9000 && status != 0x6310)
+            {
+                out.warn("GET STATUS (issuer security domain) answered " + word(status));
+                return 0;
+            }
+            return printRegistry(response.getResponseData(), scope);
+        }
+
+        GetStatusCommand.StatusType type =
+            scope == MslCore.STATUS_APPLICATIONS
+                ? GetStatusCommand.StatusType.APPLICATIONS_INCLUDING_SECURITY_DOMAINS
+                : GetStatusCommand.StatusType.EXECUTABLE_LOAD_FILES_AND_EXECUTABLE_MODULES;
+
+        GetStatusCommand command = new GetStatusCommand();
+        command.statusType(type);
+        command.deprecatedResponseFormat();
+
+        GetStatusSequence sequence = new GetStatusSequence(command);
+        ISOResponse response = runSecureCommandSequence(sequence);
+        int status = response.getStatusWord();
+
+        if (status != 0x9000 && status != 0x6310)
+        {
+            if (status == 0x6A88)
+            {
+                out.info("6A88: the card has nothing in this scope.");
+            }
+            else
+            {
+                out.warn("GET STATUS (" + type + ") answered " + word(status));
+            }
+            return 0;
+        }
+
+        // Parsed by the SDK here rather than by MslCore: on this road the SDK
+        // has already reassembled the chained response, and its RegistryData is
+        // the reading MslScript's install job has always used.
+        GetStatusResponse parsed =
+            new GetStatusResponse(command, sequence.getCompleteResponseData());
+        List entries = parsed.getAllRegistryData();
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            RegistryData entry = (RegistryData) entries.get(i);
+            if (!entry.hasAID()) { continue; }
+
+            int lifeCycle = entry.hasLifeCycleState() ? (entry.getLifeCycleState()[0] & 0xFF) : -1;
+            out.info(MslCore.hex(entry.getAID())
+                     + (lifeCycle < 0 ? ""
+                        : "  life cycle " + MslCore.hexByte(lifeCycle) + " ("
+                          + MslCore.lifeCycleName(scope, lifeCycle) + ")"));
+            report.note(MslCore.statusScopeLabel(scope) + ": " + MslCore.hex(entry.getAID()));
+        }
+        out.info(entries.size() + " entr" + (entries.size() == 1 ? "y" : "ies"));
+        return entries.size();
+    }
+
+    /** Prints one GET STATUS response, whichever format the card used. */
+    private int printRegistry(byte[] data, int scope)
+    {
+        if (data == null || data.length == 0)
+        {
+            out.info("no registry data came back for this scope");
+            return 0;
+        }
+
+        List entries;
+        try
+        {
+            entries = MslCore.parseRegistry(data, scope);
+        }
+        catch (RuntimeException e)
+        {
+            out.warn("the registry data did not parse: " + e.getMessage());
+            out.info("raw: " + MslCore.hex(data));
+            return 0;
+        }
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            MslCore.Registry entry = (MslCore.Registry) entries.get(i);
+            out.info(entry.describe(scope));
+            report.note(MslCore.statusScopeLabel(scope) + ": " + entry.describe(scope));
+
+            for (int j = 0; j < entry.modules.size(); j++)
+            {
+                out.info("    module " + MslCore.hex((byte[]) entry.modules.get(j)));
+            }
+        }
+
+        if (entries.isEmpty())
+        {
+            out.info("raw: " + MslCore.hex(data));
+            out.warn("the card answered, but nothing in the answer reads as a registry entry");
+        }
+        return entries.size();
+    }
+
+    /** True when a GET STATUS over RAM, filtered on this AID, finds it. */
+    private boolean ramRegistryHolds(Sender sender, int scope, byte[] aid)
+    {
+        byte[] apdu = MslCore.buildGetStatusApdu(scope, aid, false, false);
+        Ram answer = sender.exchange(apdu);
+
+        if (!answer.packetAccepted() || answer.inner == null)
+        {
+            out.warn("the registry could not be read back: " + answer.describe());
+            return false;
+        }
+        if (answer.inner.statusWord != 0x9000 && answer.inner.statusWord != 0x6310)
+        {
+            out.warn("GET STATUS for " + MslCore.hex(aid) + " answered "
+                     + MslCore.hexWord(answer.inner.statusWord));
+            return false;
+        }
+
+        List entries = MslCore.parseRegistry(answer.inner.data, scope);
+        for (int i = 0; i < entries.size(); i++)
+        {
+            MslCore.Registry entry = (MslCore.Registry) entries.get(i);
+            if (MslCore.equal(entry.aid, aid))
+            {
+                out.good(entry.describe(scope));
+                if (entry.lifeCycle == 0x03)
+                {
+                    out.warn("INSTALLED but not SELECTABLE: the applet will not answer a SELECT by "
+                             + "AID and is not reachable by its TAR either - OTA answers 09 (TAR "
+                             + "unknown). Nothing about its MSL can be tested in this state.");
+                }
+                return true;
+            }
+        }
+        out.warn(MslCore.hex(aid) + " is not in the registry listing that came back");
+        return false;
+    }
+
+    // ==================================================================
+    // delete - remove an instance or a package
+    // ==================================================================
+
+    /**
+     * DELETE [card content], over either road.
+     *
+     * Irreversible, and worse than irreversible for a package: with the related
+     * objects option a single DELETE takes the load file and every instance made
+     * from it. So the job reads the registry first and says exactly what it
+     * found at that AID, and refuses to send when the AID is not there at all -
+     * a DELETE at an AID the card does not have can only answer 6A88, and an
+     * operator who typed one digit wrong wants to hear that before the send,
+     * not after.
+     */
+    private void deleteObject()
+    {
+        byte[] apdu = MslCore.buildDeleteApdu(cfg.deleteAid, cfg.deleteRelatedObjects);
+
+        out.heading("What would be deleted");
+        out.info("AID              : " + MslCore.hex(cfg.deleteAid));
+        out.info("related objects  : " + (cfg.deleteRelatedObjects
+            ? "YES - the object AND everything related to it. For a package that is the load file "
+              + "and every applet instance made from it."
+            : "no - that object only. A package with instances will be refused 6985 or 6A80."));
+        out.info("DELETE APDU      : " + MslCore.hex(apdu));
+        report.installLine("DELETE " + MslCore.hex(apdu));
+
+        if (cfg.transport == MslConfig.TRANSPORT_ISD)
+        {
+            if (!openSession()) { return; }
+
+            out.heading("What is at that AID now");
+            int before = listOverSecureChannel(MslCore.STATUS_APPLICATIONS)
+                + listOverSecureChannel(MslCore.STATUS_LOAD_FILES_AND_MODULES);
+            out.info(before + " registry entr" + (before == 1 ? "y" : "ies")
+                     + " read; check the AID above appears in the listing.");
+
+            if (!confirmedForDelete()) { return; }
+
+            // The SDK's typed DeleteCommand for the plain case, which this
+            // script has used since the install job existed; the cascade has no
+            // proven setter here, so it goes as the APDU printed above through
+            // the same secure channel.
+            int status = cfg.deleteRelatedObjects
+                ? sendSecure(asGeneric("DELETE", apdu)).getStatusWord()
+                : sendSecure(new DeleteCommand().aid(cfg.deleteAid)).getStatusWord();
+
+            reportDelete(status);
+            return;
+        }
+
+        reset();
+        wakeToolkit();
+
+        Sender sender = new Sender(cfg.ramTar);
+
+        out.heading("What is at that AID now");
+        boolean isApplication = ramRegistryHolds(sender, MslCore.STATUS_APPLICATIONS,
+                                                 cfg.deleteAid);
+        boolean isLoadFile = isApplication
+            || ramRegistryHolds(sender, MslCore.STATUS_LOAD_FILES_AND_MODULES, cfg.deleteAid);
+
+        if (!isApplication && !isLoadFile)
+        {
+            out.error("Refusing to send: " + MslCore.hex(cfg.deleteAid) + " is in neither the "
+                      + "application nor the load file registry, so a DELETE for it can only "
+                      + "answer 6A88. Run the browse job and check the AID.");
+            record(MslReport.FAIL, "that AID is not on the card",
+                   "Nothing was deleted. The registry listings above are what the card reported.");
+            return;
+        }
+        if (isLoadFile && !isApplication && !cfg.deleteRelatedObjects)
+        {
+            out.warn(MslCore.hex(cfg.deleteAid) + " is a load file. If any instance was made from "
+                     + "it, this DELETE is refused unless the related-objects box is ticked.");
+        }
+
+        if (!confirmedForDelete()) { return; }
+
+        out.heading("Sending DELETE to card manager TAR " + MslCore.hex(cfg.ramTar));
+        Ram answer = sender.exchange(apdu);
+
+        if (!answer.packetAccepted())
+        {
+            out.error(answer.describe());
+            record(MslReport.FAIL, "the DELETE packet was not accepted", answer.describe());
+            return;
+        }
+        if (answer.inner == null)
+        {
+            out.warn("PoR 00, but no status word for the DELETE itself came back, so this run "
+                     + "cannot say whether it happened. Browse the card to find out.");
+            record(MslReport.UNCONFIRMED, "no inner status word for the DELETE",
+                   "PoR 00 says the packet was accepted; it says nothing about the command.");
+            return;
+        }
+        reportDelete(answer.inner.statusWord);
+    }
+
+    /** The irreversible-change gate, said once for both roads. */
+    private boolean confirmedForDelete()
+    {
+        if (cfg.confirmIrreversible) { return true; }
+
+        out.heading("Dry run");
+        out.info("Nothing was sent. Tick the irreversible-change box on the Run tab to actually "
+                 + "delete. There is no undo, and a deleted instance takes its install parameters "
+                 + "- the MSL this tool measures - with it.");
+        record(MslReport.UNKNOWN, "dry run - nothing was deleted",
+               "The DELETE APDU above was built and printed only.");
+        return false;
+    }
+
+    private void reportDelete(int status)
+    {
+        if (status == 0x9000)
+        {
+            out.good("DELETE returned 9000: " + MslCore.hex(cfg.deleteAid) + " is gone"
+                     + (cfg.deleteRelatedObjects ? ", with everything related to it." : "."));
+            record(MslReport.PASS, "deleted " + MslCore.hex(cfg.deleteAid),
+                   cfg.deleteRelatedObjects
+                       ? "With related objects: the load file and every instance made from it."
+                       : "That object only.");
+            return;
+        }
+
+        out.error("DELETE returned " + MslCore.hexWord(status));
+        if (status == 0x6A88)
+        {
+            out.info("6A88: the card does not have that AID.");
+        }
+        else if (status == 0x6985)
+        {
+            out.info("6985: the card refuses this deletion in its current state - usually a load "
+                     + "file that still has instances (tick the related-objects box) or an applet "
+                     + "the issuer has made undeletable.");
+        }
+        else if (status == 0x6982)
+        {
+            out.info("6982: the channel is not authenticated for this. Over OTA that means the "
+                     + "key set reaching the card manager is not allowed to delete.");
+        }
+        record(MslReport.FAIL, "DELETE returned " + MslCore.hexWord(status),
+               "Nothing was deleted.");
+    }
+
+    /** A hand-built APDU as a generic command, for the paths with no typed SDK equivalent. */
+    private GenericISOCommand asGeneric(String name, byte[] apdu)
+    {
+        GenericISOCommand command = new GenericISOCommand(name);
+        command.cla(apdu[0] & 0xFF).ins(apdu[1] & 0xFF).p1(apdu[2] & 0xFF).p2(apdu[3] & 0xFF);
+
+        byte[] data = new byte[apdu[4] & 0xFF];
+        System.arraycopy(apdu, 5, data, 0, data.length);
+        command.data(data).le(0x00);
+        return command;
+    }
+
+    private static String pad(String text, int width)
+    {
+        StringBuilder out = new StringBuilder(text);
+        while (out.length() < width) { out.append(' '); }
+        return out.toString();
+    }
+
 
     // ==================================================================
     // Tasks 2 and 3 - prove an MSL, or find one
@@ -551,17 +1281,7 @@ public class MslScript extends SCP02Script
     private void probe()
     {
         reset();
-
-        if (cfg.sendTerminalProfile)
-        {
-            sendTerminalProfile();
-        }
-        else
-        {
-            out.warn("TERMINAL PROFILE was not sent. A card whose toolkit has never been told "
-                     + "what the terminal supports ignores every envelope - and does it silently, "
-                     + "which reads exactly like a wrong key.");
-        }
+        wakeToolkit();
 
         Sender sender = new Sender();
         MslProbing.Oracle oracle = new MslProbing.Oracle(sender, cfg.probeBudget, cfg.silentDrop);
@@ -632,6 +1352,28 @@ public class MslScript extends SCP02Script
                  + (sender.lastCardCounter == null ? "no counter value"
                                                    : MslCore.hex(sender.lastCardCounter))
                  + ". Start the next run above that.");
+    }
+
+    /**
+     * TERMINAL PROFILE, or a clear warning that it was skipped.
+     *
+     * Every job that sends a secured packet needs this, not just probing: a
+     * card whose toolkit has never been told what the terminal supports ignores
+     * SMS-PP DOWNLOAD whoever sent it, so an ota-install would read as a dead
+     * card manager key.
+     */
+    private void wakeToolkit()
+    {
+        if (cfg.sendTerminalProfile)
+        {
+            sendTerminalProfile();
+        }
+        else
+        {
+            out.warn("TERMINAL PROFILE was not sent. A card whose toolkit has never been told "
+                     + "what the terminal supports ignores every envelope - and does it silently, "
+                     + "which reads exactly like a wrong key.");
+        }
     }
 
     private void sendTerminalProfile()
@@ -722,14 +1464,56 @@ public class MslScript extends SCP02Script
     private final class Sender implements MslProbing.Sender
     {
         private final SCP80Security security;
+        private final byte[] tar;
         private long counter;
         byte[] lastCardCounter;
 
+        /**
+         * What the next packet carries, and what the last one got back.
+         *
+         * A probe carries one inert byte and the caller only wants the outcome;
+         * a RAM step carries a real card content management APDU and the caller
+         * needs the whole PoR, because the status word of the command inside it
+         * lives in the response data. Rather than two packet builders, there is
+         * one, with the payload set per call and the PoR kept where exchange()
+         * can read it.
+         */
+        private byte[] payload = { 0x00 };
+        private MslCore.Por lastPor;
+        int sent;
+
         Sender()
+        {
+            this(cfg.targetTar);
+        }
+
+        Sender(byte[] tar)
         {
             // KIc (ciphering) first, KID (integrity) second - independent keys.
             security = new DefaultSCP80Security(cfg.effectiveKicKey(), cfg.otaKey);
+            this.tar = tar;
             counter = cfg.startCounter;
+        }
+
+        /**
+         * One RAM step: the APDU goes to this sender's TAR inside a secured
+         * packet, and what comes back is the PoR plus the status word of the
+         * command the card manager executed.
+         */
+        Ram exchange(byte[] apdu)
+        {
+            byte[] previous = payload;
+            try
+            {
+                payload = apdu;
+                lastPor = null;
+                MslProbing.Result result = send(cfg.ramProbe());
+                return new Ram(result, lastPor);
+            }
+            finally
+            {
+                payload = previous;
+            }
         }
 
         public MslProbing.Result send(MslProbing.Probe probe)
@@ -754,14 +1538,14 @@ public class MslScript extends SCP02Script
                 SCP80SecurityParameters parameters =
                     new SCP80SecurityParameters(spi, header, header);
                 SecuredCommandPacket packet = SecuredCommandPacketFactory.secureForSMS(
-                    security, parameters, cfg.targetTar, counterBytes(value),
-                    new byte[] { 0x00 });
+                    security, parameters, tar, counterBytes(value), payload);
 
                 byte[] envelope = MslCore.buildEnvelope(packet.toByteArray(), "0000000000");
 
                 GenericISOCommand command = new GenericISOCommand("ENVELOPE (SMS-PP DOWNLOAD)");
                 command.cla(0x80).ins(0xC2).p1(0x00).p2(0x00).data(envelope).noLe();
 
+                sent++;
                 ISOResponse response = MslScript.this.send(command);
                 return read(probe, response);
             }
@@ -819,6 +1603,7 @@ public class MslScript extends SCP02Script
             }
 
             MslCore.Por por = MslCore.parsePor(data);
+            lastPor = por;
             MslProbing.Result result;
 
             if (por == null)
@@ -872,6 +1657,45 @@ public class MslScript extends SCP02Script
                 out = (out << 8) | (value[i] & 0xFF);
             }
             return out;
+        }
+    }
+
+    /**
+     * What one RAM step got back.
+     *
+     * Two status words matter and they are not the same thing. The PoR status
+     * says what happened to the PACKET - 00 means the MAC was good, the counter
+     * was accepted and the TAR resolved. The inner status word, inside the PoR's
+     * response data, says what the card manager did with the command. An INSTALL
+     * the card refused with 6A80 arrives inside a perfectly good PoR 00, so a
+     * run that checked only the PoR would report a load that never happened.
+     */
+    private static final class Ram
+    {
+        final MslProbing.Result result;
+        final MslCore.Por por;
+        final MslCore.RamResponse inner;
+
+        Ram(MslProbing.Result result, MslCore.Por por)
+        {
+            this.result = result;
+            this.por = por;
+            this.inner = (por == null) ? null : MslCore.parseRamResponse(por.responseData);
+        }
+
+        boolean packetAccepted()
+        {
+            return por != null && por.status == 0x00;
+        }
+
+        String describe()
+        {
+            if (por == null)
+            {
+                return "no PoR came back" + (result == null ? "" : " - " + result.note);
+            }
+            return "PoR status " + MslCore.hexByte(por.status)
+                + (inner == null ? ", no command status in it" : ", " + inner.describe());
         }
     }
 

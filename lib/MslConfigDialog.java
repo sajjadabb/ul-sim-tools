@@ -99,7 +99,11 @@ public final class MslConfigDialog extends JFrame
     private final JComboBox modeCombo = new JComboBox(new String[] {
         "discover - find the MSL an installed applet enforces",
         "verify - prove a known MSL is the one in force",
-        "install - put an applet on the card with a chosen MSL" });
+        "install - put an applet on the card with a chosen MSL (SCP02)",
+        "ota-install - load a CAP and install from it over OTA (irreversible)",
+        "browse - list the applets and packages on the card (read-only)",
+        "delete - remove an applet instance or a package (irreversible)" });
+    private final JLabel jobSteps = new JLabel();
     private final JTextField cardLabelField = new JTextField(20);
     private final JTextField operatorField = new JTextField(20);
 
@@ -191,6 +195,24 @@ public final class MslConfigDialog extends JFrame
     private final JCheckBox silentDropCheck = new JCheckBox(
         "Card discards below-MSL packets silently (read a no-PoR drop as below-MSL)");
 
+    // -- card content management ------------------------------------------
+    private final JComboBox transportCombo = new JComboBox(new String[] {
+        "OTA  -  secured packets to the card manager TAR (no SCP02 keys needed)",
+        "SCP02 -  a secure channel to the ISD over the contact interface" });
+    private final JComboBox ramTarCombo = editable(new String[] { "000000" });
+    private final JComboBox blockSizeCombo = editable(new String[] { "160", "128", "96", "192" });
+    private final JCheckBox plainAppletCheck = new JCheckBox(
+        "Plain applet - install with empty application parameters (no MSL, no TAR)");
+    private final JTextField deleteAidField = new JTextField(24);
+    private final JCheckBox deleteRelatedCheck = new JCheckBox(
+        "Delete related objects too (a package AND every instance made from it)");
+    private final JCheckBox browseApplicationsCheck = new JCheckBox(
+        "Applications and security domains (GET STATUS P1 40)", true);
+    private final JCheckBox browseLoadFilesCheck = new JCheckBox(
+        "Packages and the modules inside them (GET STATUS P1 10)", true);
+    private final JCheckBox browseIsdCheck = new JCheckBox(
+        "The issuer security domain itself (GET STATUS P1 80)");
+
     // -- report ----------------------------------------------------------
     private final JCheckBox writeReportCheck = new JCheckBox(
         "Write an HTML and CSV report when the run finishes", true);
@@ -201,7 +223,7 @@ public final class MslConfigDialog extends JFrame
     private final JCheckBox matchCheck = new JCheckBox(
         "These values match the SIM currently in the reader");
     private final JCheckBox changeCheck = new JCheckBox(
-        "I accept that this run installs an applet on that SIM");
+        "I accept that this run changes that SIM and cannot be undone");
 
     private final JLabel problemsLabel = new JLabel();
     private final JButton startButton = new JButton("Start run");
@@ -343,6 +365,7 @@ public final class MslConfigDialog extends JFrame
         tabs.addTab("Job", inScroller(buildJobTab(scriptName)));
         tabs.addTab("GlobalPlatform", inScroller(buildGpTab()));
         tabs.addTab("Applet", inScroller(buildAppletTab()));
+        tabs.addTab("Card content", inScroller(buildCardContentTab()));
         tabs.addTab("Minimum Security Level", inScroller(buildMslTab()));
         tabs.addTab("OTA key set", inScroller(buildOtaTab()));
         tabs.addTab("Probing", inScroller(buildProbeTab()));
@@ -395,21 +418,11 @@ public final class MslConfigDialog extends JFrame
                 + "no command changes it afterwards."));
         }
 
-        row = wide(job, c, row, steps(installSelected()
-            ? new String[] {
-                "Open an SCP02 secure channel to the ISD.",
-                "Optionally DELETE an existing instance with the same AID.",
-                "Load the CAP if the executable load file is not already on the card.",
-                "INSTALL [for install and make selectable] with the parameters built on the MSL tab.",
-                "Confirm in the registry that the instance is SELECTABLE - an applet that is not "
-                + "selectable is unreachable by its TAR, and OTA answers 09 rather than anything "
-                + "about security." }
-            : new String[] {
-                "Send TERMINAL PROFILE so the card's toolkit is awake.",
-                "Send one secured packet per probe, each carrying a single inert byte.",
-                "Read the response status: 0A means below the MSL, anything else means the packet "
-                + "got past the security gate.",
-                "Infer the MSL, then check the inference with further probes." }));
+        // Rewritten by updateReadouts() whenever the job changes: a step list
+        // describing a different job than the one selected is worse than none.
+        jobSteps.setForeground(new Color(50, 60, 70));
+        jobSteps.setBorder(BorderFactory.createEmptyBorder(2, 2, 8, 2));
+        row = wide(job, c, row, jobSteps);
 
         JPanel who = group("Identification");
         GridBagConstraints c2 = newConstraints();
@@ -506,6 +519,92 @@ public final class MslConfigDialog extends JFrame
             + "the disagreement."));
 
         return tabOf(new JPanel[] { aids, cap, how });
+    }
+
+    /**
+     * Everything the three card content management jobs need: ota-install,
+     * browse and delete.
+     *
+     * They share a tab because they share the question the tab answers - which
+     * road to the card manager, and with what - and because an operator who
+     * browsed to find an AID is usually about to delete or install at it.
+     */
+    private JPanel buildCardContentTab()
+    {
+        JPanel road = group("How to reach the card manager");
+        GridBagConstraints c = newConstraints();
+        int row = 0;
+        row = wide(road, c, row, hint("Card content management is GlobalPlatform work and there "
+            + "are two roads to it. OTA wraps each command in a secured packet addressed to the "
+            + "card manager's TAR and needs only the OTA key set, which is the road an operator "
+            + "with no ISD keys has. SCP02 opens a secure channel over the contact interface and "
+            + "needs the ENC/MAC/DEK keys on the GlobalPlatform tab. ota-install is OTA by "
+            + "definition; install is SCP02; browse and delete can take either."));
+        row = addRow(road, c, row, "Road:", tip(transportCombo,
+            "Which road browse and delete take. On the MCI/Hamrah card the OTA road is confirmed "
+            + "reachable with the KVN 01 key set - GET STATUS answered PoR 00 - and no ISD keys "
+            + "were ever needed."));
+        row = addRow(road, c, row, "Card manager TAR:", tip(ramTarCombo,
+            "Where a secured packet carrying an INSTALL, GET STATUS or DELETE is addressed. "
+            + "000000 on every card this tool has met, and issuer-assigned like any other TAR."));
+
+        JPanel load = group("ota-install: loading the CAP");
+        GridBagConstraints c2 = newConstraints();
+        int row2 = 0;
+        row2 = wide(load, c2, row2, hint("The CAP path, module AID, instance AID and privileges "
+            + "come from the Applet tab; the load file AID is NOT asked for, because the CAP's "
+            + "own Header component declares it and the run cross-checks that reading against "
+            + "the SDK's LoadSequence before it sends anything."));
+        row2 = addRow(load, c2, row2, "LOAD block size:", tip(blockSizeCombo,
+            "Bytes of load file per LOAD command, decimal. Over OTA each APDU has to fit one "
+            + "SMS-PP envelope once the secured packet, the UDH, the TPDU and the CAT envelope "
+            + "are wrapped around it - so this is far below the 255 a contact channel allows. "
+            + "160 is the tested value; above " + (MslCapLoad.MAX_OTA_APDU - 5) + " the packets "
+            + "become undeliverable rather than merely slow."));
+        row2 = wide(load, c2, row2, tip(plainAppletCheck,
+            "For an applet that is not a toolkit application - one extending "
+            + "javacard.framework.Applet, like the operator's MobilePaymentApplet. It installs "
+            + "with the mandatory empty C9 and no toolkit block at all: no MSL, no TAR. A card "
+            + "sent a toolkit block for an applet that has no business with one answers 6A80."));
+
+        JPanel browse = group("browse: what to list");
+        GridBagConstraints c3 = newConstraints();
+        int row3 = 0;
+        row3 = wide(browse, c3, row3, hint("Read-only. Over OTA each scope costs one secured "
+            + "packet and therefore one step of the OTA counter; over SCP02 it costs nothing but "
+            + "the session. This is the job to run before an install or a delete - it is the only "
+            + "way to learn the AIDs a card actually has."));
+        row3 = wide(browse, c3, row3, tip(browseApplicationsCheck,
+            "Applet instances and supplementary security domains, with their life cycle state. "
+            + "Life cycle 07 is SELECTABLE; 03 is INSTALLED but not selectable, which also means "
+            + "unreachable by TAR."));
+        row3 = wide(browse, c3, row3, tip(browseLoadFilesCheck,
+            "Packages (executable load files) and the executable modules inside each. The module "
+            + "AID is what an INSTALL needs and what nobody can read off a CAP they do not have."));
+        row3 = wide(browse, c3, row3, tip(browseIsdCheck,
+            "The card manager's own entry and its life cycle - OP_READY, INITIALIZED, SECURED, "
+            + "CARD_LOCKED or TERMINATED. Over SCP02 this one scope is sent as an APDU built by "
+            + "MslCore rather than by the SDK's typed command, because the SDK constant for it is "
+            + "not one this tool has verified."));
+
+        JPanel remove = group("delete: what to remove - IRREVERSIBLE");
+        GridBagConstraints c4 = newConstraints();
+        int row4 = 0;
+        row4 = addRow(remove, c4, row4, "AID to delete:", tip(deleteAidField,
+            "An applet instance AID or a package (load file) AID. The run reads the registry "
+            + "first and refuses to send when the card does not have this AID at all - a DELETE "
+            + "at a mistyped AID can only answer 6A88, and hearing that before the send is the "
+            + "point."));
+        row4 = wide(remove, c4, row4, tip(deleteRelatedCheck,
+            "DELETE with P2 80. For a package that still has instances this is the only thing "
+            + "that works, and it takes those instances with it - including their install "
+            + "parameters, which is where the MSL lives. The run names everything it found at "
+            + "that AID before it sends."));
+        row4 = wide(remove, c4, row4, hint("A deleted applet cannot be restored by this tool or "
+            + "any other: the CAP can be loaded again, but the instance, its MSL and anything it "
+            + "stored are gone. Prefer a disposable test card."));
+
+        return tabOf(new JPanel[] { road, load, browse, remove });
     }
 
     private JPanel buildMslTab()
@@ -714,12 +813,15 @@ public final class MslConfigDialog extends JFrame
 
         {
             row = wide(safety, c, row, tip(changeCheck,
-                "Installing changes the card and there is no undo. An MSL cannot be edited "
-                + "afterwards - changing it means deleting the instance and installing again. "
-                + "Only the install job needs this."));
-            row = wide(safety, c, row, hint("The two probing jobs are read-only in the sense that "
-                + "matters: they install nothing and delete nothing. They do move the card's OTA "
-                + "counter, which is why the probe budget is a hard stop."));
+                "Required by the three jobs that change the card: install, ota-install and "
+                + "delete. There is no undo for any of them. An MSL cannot be edited afterwards - "
+                + "changing one means deleting the instance and installing again - and a deleted "
+                + "applet takes its install parameters with it. Until this is ticked those jobs "
+                + "build every packet, print them, and send nothing."));
+            row = wide(safety, c, row, hint("The other jobs are read-only in the sense that "
+                + "matters: discover, verify and browse install nothing and delete nothing. The "
+                + "two probing jobs do move the card's OTA counter, which is why the probe budget "
+                + "is a hard stop, and browse over OTA moves it one step per scope."));
         }
 
         return tabOf(new JPanel[] { report, safety });
@@ -760,6 +862,11 @@ public final class MslConfigDialog extends JFrame
         terminalProfileCombo.setSelectedItem(profile.get("terminal.profile", "02"));
         reportFolderField.setText(profile.get("report.folder", ""));
 
+        ramTarCombo.setSelectedItem(profile.get("ram.tar", "000000"));
+        blockSizeCombo.setSelectedItem(profile.get("load.blockSize",
+                                       String.valueOf(MslCapLoad.DEFAULT_BLOCK_SIZE)));
+        deleteAidField.setText(profile.get("delete.aid", ""));
+
         claimedIntegrityCombo.setSelectedItem(IntegrityLevel.CRYPTOGRAPHIC_CHECKSUM);
         claimedCipherCombo.setSelectedItem(CipherMode.OFF);
         claimedCounterCombo.setSelectedItem(CounterMode.PROCESS_IF_HIGHER);
@@ -783,7 +890,7 @@ public final class MslConfigDialog extends JFrame
                                 loadFileAidField,
                                 moduleAidField, instanceAidField, extraTarsField, rawParamsField,
                                 counterField, scp02EncField, scp02MacField, scp02DekField,
-                                otaKeyField, otaKicKeyField };
+                                otaKeyField, otaKicKeyField, deleteAidField };
         for (int i = 0; i < fields.length; i++)
         {
             fields[i].getDocument().addDocumentListener(listener);
@@ -794,7 +901,8 @@ public final class MslConfigDialog extends JFrame
                                tarCombo, priorityCombo, timersCombo, menuTextCombo, channelsCombo, installFormatCombo,
                                targetTarCombo, otaKvnCombo, otaAlgCombo, porModeCombo, porSmsCombo,
                                terminalProfileCombo, claimedIntegrityCombo, claimedCipherCombo,
-                               claimedCounterCombo, budgetCombo };
+                               claimedCounterCombo, budgetCombo,
+                               transportCombo, ramTarCombo, blockSizeCombo };
         for (int i = 0; i < combos.length; i++)
         {
             combos[i].addActionListener(action);
@@ -804,7 +912,9 @@ public final class MslConfigDialog extends JFrame
         JCheckBox[] boxes = { writeReportCheck, noMslCheck, deleteExistingCheck,
                               makeSelectableCheck, localApduCheck,
                               terminalProfileCheck, allowCipheringCheck, allowOneHigherCheck, silentDropCheck,
-                              matchCheck, changeCheck };
+                              matchCheck, changeCheck,
+                              plainAppletCheck, deleteRelatedCheck, browseApplicationsCheck,
+                              browseLoadFilesCheck, browseIsdCheck };
         for (int i = 0; i < boxes.length; i++)
         {
             boxes[i].addActionListener(action);
@@ -847,6 +957,11 @@ public final class MslConfigDialog extends JFrame
         {
             problems.add("Confirm on the Run tab that these values match the SIM in the reader.");
         }
+        // install is the one card-changing job with no dry run of its own - it
+        // opens a secure channel and sends - so it is gated here. ota-install
+        // and delete are not: without the acknowledgement they build every
+        // packet, print it and send nothing, which is a run worth being able to
+        // start. The checkbox is what turns that dry run into a real one.
         if (installSelected() && !changeCheck.isSelected())
         {
             problems.add("Confirm on the Run tab that this run may install an applet on that SIM.");
@@ -861,6 +976,33 @@ public final class MslConfigDialog extends JFrame
 
     private void updateReadouts()
     {
+        int mode = selectedMode();
+        jobSteps.setText(stepsHtml(stepsFor(mode)));
+
+        // The acknowledgement says what it will actually authorise, which is a
+        // different thing per job: for install and delete it is the only thing
+        // standing between Start and a change that cannot be undone, and for
+        // ota-install it is what turns the dry run into a real load.
+        if (mode == MslConfig.MODE_INSTALL)
+        {
+            changeCheck.setText("I accept that this run installs an applet on that SIM");
+        }
+        else if (mode == MslConfig.MODE_OTA_INSTALL)
+        {
+            changeCheck.setText("Really load and install over OTA - leave this clear for a dry "
+                                + "run that builds every packet and sends none");
+        }
+        else if (mode == MslConfig.MODE_DELETE)
+        {
+            changeCheck.setText("Really delete that AID - leave this clear for a dry run that "
+                                + "builds the DELETE and sends it nowhere");
+        }
+        else
+        {
+            changeCheck.setText("I accept that this run changes that SIM and cannot be undone "
+                                + "(not needed by this job)");
+        }
+
         MslCore.Level level = mslFrom(mslIntegrityCombo, mslCipherCombo, mslCounterCombo);
         mslReadout.setText(noMslCheck.isSelected()
             ? "<html><b>No MSL field</b> - the applet will enforce no minimum.</html>"
@@ -960,6 +1102,25 @@ public final class MslConfigDialog extends JFrame
             config.rawInstallParameters = raw.length() == 0 ? null : MslCore.unhex(raw);
         }
         {
+            config.transport = transportCombo.getSelectedIndex() == 1
+                ? MslConfig.TRANSPORT_ISD : MslConfig.TRANSPORT_OTA;
+            config.ramTar = hexOf(ramTarCombo);
+            config.loadBlockSize = decimalOf(blockSizeCombo, MslCapLoad.DEFAULT_BLOCK_SIZE);
+            config.plainApplet = plainAppletCheck.isSelected();
+
+            config.browseApplications = browseApplicationsCheck.isSelected();
+            config.browseLoadFiles = browseLoadFilesCheck.isSelected();
+            config.browseIssuerSecurityDomain = browseIsdCheck.isSelected();
+
+            config.deleteAid = hexOf(deleteAidField);
+            config.deleteRelatedObjects = deleteRelatedCheck.isSelected();
+
+            // The one acknowledgement that authorises an irreversible send. The
+            // scripts read this, not the checkbox: a dialog that was cancelled
+            // never produced a config at all.
+            config.confirmIrreversible = changeCheck.isSelected();
+        }
+        {
             config.targetTar = hexOf(targetTarCombo);
             config.otaKvn = intOf(otaKvnCombo, 0x01);
             config.otaAlgorithm = String.valueOf(otaAlgCombo.getSelectedItem());
@@ -1015,12 +1176,68 @@ public final class MslConfigDialog extends JFrame
         int index = modeCombo.getSelectedIndex();
         if (index == 1) { return MslConfig.MODE_VERIFY; }
         if (index == 2) { return MslConfig.MODE_INSTALL; }
+        if (index == 3) { return MslConfig.MODE_OTA_INSTALL; }
+        if (index == 4) { return MslConfig.MODE_BROWSE; }
+        if (index == 5) { return MslConfig.MODE_DELETE; }
         return MslConfig.MODE_DISCOVER;
     }
 
     private boolean installSelected()
     {
         return selectedMode() == MslConfig.MODE_INSTALL;
+    }
+
+    /** The steps the selected job will take, in order, for the Job tab. */
+    private String[] stepsFor(int mode)
+    {
+        if (mode == MslConfig.MODE_INSTALL)
+        {
+            return new String[] {
+                "Open an SCP02 secure channel to the ISD.",
+                "Optionally DELETE an existing instance with the same AID.",
+                "Load the CAP if the executable load file is not already on the card.",
+                "INSTALL [for install and make selectable] with the parameters built on the MSL tab.",
+                "Confirm in the registry that the instance is SELECTABLE - an applet that is not "
+                + "selectable is unreachable by its TAR, and OTA answers 09 rather than anything "
+                + "about security." };
+        }
+        if (mode == MslConfig.MODE_OTA_INSTALL)
+        {
+            return new String[] {
+                "Read the CAP and build INSTALL [for load], the LOAD chain and INSTALL [for "
+                + "install] - then print every one of them.",
+                "Cross-check the load file against the SDK's own reading of the same CAP: same "
+                + "AID, same SHA-1, or nothing is sent.",
+                "Stop there unless the irreversible-change box is ticked. That is the dry run.",
+                "Send TERMINAL PROFILE, then each APDU inside its own secured packet to the card "
+                + "manager TAR, checking both the PoR status and the card's own status word for "
+                + "each.",
+                "Read the registry back over OTA to confirm the instance is there." };
+        }
+        if (mode == MslConfig.MODE_BROWSE)
+        {
+            return new String[] {
+                "Open the chosen road: a secured packet to the card manager, or an SCP02 channel.",
+                "GET STATUS once per scope selected on the Card content tab.",
+                "Follow the card's 6310 continuations until the listing is complete.",
+                "Print every AID with its life cycle, and the modules inside each package. "
+                + "Nothing is written to the card." };
+        }
+        if (mode == MslConfig.MODE_DELETE)
+        {
+            return new String[] {
+                "Build the DELETE and print it.",
+                "Read the registry first and say what is actually at that AID - refusing to send "
+                + "when the card does not have it.",
+                "Stop there unless the irreversible-change box is ticked. That is the dry run.",
+                "Send the DELETE and report both the PoR status and the card's own status word." };
+        }
+        return new String[] {
+            "Send TERMINAL PROFILE so the card's toolkit is awake.",
+            "Send one secured packet per probe, each carrying a single inert byte.",
+            "Read the response status: 0A means below the MSL, anything else means the packet "
+            + "got past the security gate.",
+            "Infer the MSL, then check the inference with further probes." };
     }
 
     private void onStart()
@@ -1196,7 +1413,7 @@ public final class MslConfigDialog extends JFrame
     }
 
     /** A numbered list, for describing a sequence the operator is about to start. */
-    private JLabel steps(String[] items)
+    private String stepsHtml(String[] items)
     {
         StringBuilder html = new StringBuilder("<html><div style='width:" + TEXT_WIDTH
                                                + "px'><ol>");
@@ -1205,11 +1422,7 @@ public final class MslConfigDialog extends JFrame
             html.append("<li style='margin-bottom:4px'>").append(escape(items[i])).append("</li>");
         }
         html.append("</ol></div></html>");
-
-        JLabel label = new JLabel(html.toString());
-        label.setForeground(new Color(50, 60, 70));
-        label.setBorder(BorderFactory.createEmptyBorder(2, 2, 8, 2));
-        return label;
+        return html.toString();
     }
 
     private String bullets(List problems)
@@ -1265,6 +1478,29 @@ public final class MslConfigDialog extends JFrame
         try
         {
             return Integer.parseInt(text, 16);
+        }
+        catch (NumberFormatException e)
+        {
+            return fallback;
+        }
+    }
+
+    /**
+     * A decimal value from an editable combo.
+     *
+     * Decimal, not hex, and the only such field in this dialog: a LOAD block
+     * size is a byte count an operator thinks about in tens, not a card value.
+     * Everything else here is hex because the card's own documents are.
+     */
+    private int decimalOf(JComboBox combo, int fallback)
+    {
+        Object value = combo.getSelectedItem();
+        String text = value == null ? "" : String.valueOf(value).trim();
+        if (text.length() == 0) { return fallback; }
+
+        try
+        {
+            return Integer.parseInt(text, 10);
         }
         catch (NumberFormatException e)
         {

@@ -294,6 +294,162 @@ check("the tolerant walk still parses a truncated block to 'no MSL' - which is e
 
 
 # ---------------------------------------------------------------------------
+# GET STATUS, DELETE, and what a RAM packet answers
+#
+# The twins of the same checks in selftest/MslSelfTest.java. Both sides are
+# diffed against each other on the same inputs, which is the only thing that
+# makes "ports of each other" mean anything: a card content management APDU
+# built one way here and another way there is a card that behaves differently
+# depending on which half of the tool reached it.
+# ---------------------------------------------------------------------------
+
+check("GET STATUS for applications is 80 F2 40 00 02 4F 00 00",
+      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS)) == "80F24000024F0000",
+      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS)))
+check("an AID filter goes in tag 4F",
+      m.hexs(m.build_get_status_apdu(m.STATUS_APPLICATIONS, m.unhex("A000000009")))
+      == "80F24000074F05A00000000900")
+check("the next-occurrence continuation sets P2 bit b1",
+      bytearray(m.build_get_status_apdu(m.STATUS_APPLICATIONS, b"", True))[3] == 0x01)
+check("asking for the TLV response format sets P2 bit b2",
+      bytearray(m.build_get_status_apdu(m.STATUS_APPLICATIONS, b"", False, True))[3] == 0x02)
+check("the load-file scope asks for modules too (P1 10)",
+      m.scope_carries_modules(m.STATUS_LOAD_FILES_AND_MODULES)
+      and not m.scope_carries_modules(m.STATUS_LOAD_FILES))
+
+check("DELETE of an instance is 80 E4 00 00, tag 4F, Le 00",
+      m.hexs(m.build_delete_apdu(m.unhex("A000000009000102")))
+      == "80E400000A4F08A00000000900010200",
+      m.hexs(m.build_delete_apdu(m.unhex("A000000009000102"))))
+check("DELETE with related objects sets P2 to 80 - the cascade, not a different command",
+      bytearray(m.build_delete_apdu(m.unhex("A000000009"), True))[3] == 0x80)
+check("DELETE refuses an AID too short to be one",
+      raises(lambda: m.build_delete_apdu(m.unhex("A0000000"))))
+
+# PoR 00 is about the packet; the inner status word is about the command. A run
+# that reads only the first reports a refused INSTALL as a successful one.
+check("a RAM response shorter than a status word reads as none at all",
+      m.parse_ram_response(m.unhex("0190")) is None and m.parse_ram_response(None) is None)
+_ram = m.parse_ram_response(m.unhex("019000"))
+check("a RAM response reads the command count and the status word",
+      _ram is not None and _ram["commands"] == 1 and _ram["sw"] == 0x9000)
+_ram = m.parse_ram_response(m.unhex("016A80"))
+check("a refused command inside an accepted packet carries its own status word",
+      _ram is not None and _ram["sw"] == 0x6A80)
+_ram = m.parse_ram_response(m.unhex("0190000102030405"))
+check("the response data of the last command follows the status word",
+      _ram is not None and m.hexs(_ram["data"]) == "0102030405")
+
+_entries = m.parse_registry_compact(m.unhex("08A0000000090001020700"
+                                            "05A00000000900" "0300"),
+                                    m.STATUS_APPLICATIONS)
+check("the compact registry format reads every entry", len(_entries) == 2, str(len(_entries)))
+check("the first entry's AID is read whole",
+      _entries and m.hexs(_entries[0].aid) == "A000000009000102")
+check("life cycle 07 is SELECTABLE",
+      _entries and _entries[0].life_cycle == 0x07
+      and m.life_cycle_name(m.STATUS_APPLICATIONS, 0x07) == "SELECTABLE")
+check("life cycle 03 is INSTALLED but not selectable",
+      m.life_cycle_name(m.STATUS_APPLICATIONS, 0x03) == "INSTALLED")
+check("the locked bit is reported as LOCKED whatever the rest of the byte says",
+      m.life_cycle_name(m.STATUS_APPLICATIONS, 0x83) == "LOCKED")
+check("a load file's 01 is LOADED, not OP_READY",
+      m.life_cycle_name(m.STATUS_LOAD_FILES, 0x01) == "LOADED"
+      and m.life_cycle_name(m.STATUS_ISSUER_SECURITY_DOMAIN, 0x01) == "OP_READY")
+
+_modules = m.parse_registry_compact(m.unhex("05A000000009" "0100" "01" "07A0000000090001"),
+                                    m.STATUS_LOAD_FILES_AND_MODULES)
+check("a load file entry carries its modules",
+      len(_modules) == 1 and len(_modules[0].modules) == 1, str(len(_modules)))
+check("the module AID is read out of the module list",
+      _modules and m.hexs(_modules[0].modules[0]) == "A0000000090001")
+
+# E3 11 { 4F 08 <AID>  9F70 01 07  C5 01 00 } - 17 bytes of template.
+_tlv = m.parse_registry(m.unhex("E311" "4F08A000000009000102" "9F700107" "C50100"),
+                        m.STATUS_APPLICATIONS)
+check("the TLV registry format is recognised from its E3 template", len(_tlv) == 1,
+      str(len(_tlv)))
+check("the TLV entry's AID comes from tag 4F",
+      _tlv and m.hexs(_tlv[0].aid) == "A000000009000102")
+check("the TLV entry's life cycle comes from tag 9F70, a two-byte tag",
+      _tlv and _tlv[0].life_cycle == 0x07)
+check("the TLV entry's privileges come from tag C5",
+      _tlv and m.hexs(_tlv[0].privileges) == "00")
+
+check("a truncated registry stops rather than inventing an entry",
+      m.parse_registry_compact(m.unhex("08A000"), m.STATUS_APPLICATIONS) == [])
+check("an empty registry response is no entries, not an error",
+      m.parse_registry(b"", m.STATUS_APPLICATIONS) == []
+      and m.parse_registry(None, m.STATUS_APPLICATIONS) == [])
+
+
+# ---------------------------------------------------------------------------
+# Real wire bytes, end to end
+#
+# Whole response packets, parsed the way a run parses them. Not hand-written:
+# captured off the simulated card in selftest_ram.py, which answers secured
+# packets at the reader interface. selftest/MslSelfTest.java asserts the same
+# five vectors, so both halves of the tool are shown to read the same bytes the
+# same way - and the Java half has no other end-to-end test available to it,
+# since it needs the UL SDK jar to run at all.
+# ---------------------------------------------------------------------------
+
+def ram_chain(vector, scope):
+    """response packet -> PoR -> the RAM response in it -> the registry in that."""
+    import msl_tool as tool
+    por = tool.parse_por(m.unhex(vector))
+    ram = m.parse_ram_response(por["additional"]) if por else None
+    entries = m.parse_registry(ram["data"], scope) if ram else []
+    return por, ram, entries
+
+
+_APPS_FIRST = "02710000170A00000000030000000000016310061122334455000300"
+_APPS_NEXT = "027100001D0A000000000300000000000190000CA0000000871002FF49FF05890700"
+_ELF_SCOPE = "027100001E0A0000000003000000000001900005112233445501000106112233445500"
+_DELETE_OK = "027100000E0A00000000030000000000019000"
+_DELETE_6A88 = "027100000E0A00000000030000000000016A88"
+
+_por, _ram, _entries = ram_chain(_APPS_FIRST, m.STATUS_APPLICATIONS)
+check("a captured response packet parses", _por is not None)
+check("the PoR status says the packet was accepted", _por and _por["status"] == 0x00)
+check("the counter the card echoed is read from the right offset",
+      _por and _por["counter"] == "0003000000", _por and _por["counter"])
+check("the command inside an accepted packet answered 6310 - there is more to come",
+      _ram is not None and _ram["sw"] == 0x6310)
+check("the truncated first listing still yields its one complete entry",
+      len(_entries) == 1, str(len(_entries)))
+check("that entry is the instance, INSTALLED but not selectable",
+      len(_entries) == 1 and m.hexs(_entries[0].aid) == "112233445500"
+      and _entries[0].life_cycle == 0x03)
+
+_por, _ram, _entries = ram_chain(_APPS_NEXT, m.STATUS_APPLICATIONS)
+check("the continuation answered 9000 - the listing is complete",
+      _ram is not None and _ram["sw"] == 0x9000)
+check("the continuation carries the entry the first listing left out",
+      len(_entries) == 1 and m.hexs(_entries[0].aid) == "A0000000871002FF49FF0589",
+      str(len(_entries)))
+check("that entry is SELECTABLE", _entries and _entries[0].life_cycle == 0x07)
+
+_por, _ram, _entries = ram_chain(_ELF_SCOPE, m.STATUS_LOAD_FILES_AND_MODULES)
+check("the load file scope yields the package", len(_entries) == 1, str(len(_entries)))
+check("the package AID and its LOADED life cycle are read",
+      _entries and m.hexs(_entries[0].aid) == "1122334455"
+      and _entries[0].life_cycle == 0x01)
+check("the module inside the package is read - the AID an INSTALL needs",
+      _entries and len(_entries[0].modules) == 1
+      and m.hexs(_entries[0].modules[0]) == "112233445500")
+
+# A DELETE that worked and one for an AID the card does not have arrive inside
+# the same accepted packet; only the inner word tells them apart.
+_por, _ram, _ = ram_chain(_DELETE_OK, m.STATUS_APPLICATIONS)
+check("a DELETE that worked: PoR 00 and card SW 9000",
+      _por["status"] == 0x00 and _ram["sw"] == 0x9000 and _ram["data"] == b"")
+_por, _ram, _ = ram_chain(_DELETE_6A88, m.STATUS_APPLICATIONS)
+check("a DELETE for an AID the card lacks: the same PoR 00, card SW 6A88",
+      _por["status"] == 0x00 and _ram["sw"] == 0x6A88)
+
+
+# ---------------------------------------------------------------------------
 # The packet builder in msl_tool.py
 #
 # These are structural checks, not crypto vectors: there is no authoritative

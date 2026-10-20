@@ -259,6 +259,12 @@ def parse_por(data):
         "raw": hexs(data),
     }
     payload = data[body + 10 + max(0, rhl - 10):]
+    # The additional response data, whole: for a RAM packet that is the number
+    # of executed commands, the status word of the last one, and its response
+    # data (TS 102 226 clause 5.2). The browse job needs that response data --
+    # a registry listing lives in it -- so it is carried rather than summarised
+    # away.
+    parsed["additional"] = bytes(payload)
     if len(payload) >= 3:
         parsed["commands"] = payload[0]
         parsed["last_sw"] = "%02X%02X" % (payload[1], payload[2])
@@ -391,7 +397,12 @@ class OtaProbeSender(object):
 
         por = parse_por(data) if data else None
         self.last_inner_sw = None
+        self.last_ram = None
         if por is not None:
+            # The whole RAM response, for the callers that need the response
+            # data and not just the status word (browse reads a registry out
+            # of it).
+            self.last_ram = m.parse_ram_response(por.get("additional"))
             try:
                 self.card_counter = int(por["counter"], 16)
             except (KeyError, ValueError):
@@ -672,16 +683,215 @@ def command_ota_install(args):
             if result.status != 0x00:
                 print("STOPPED at %s: PoR status %02X" % (name, result.status))
                 return 1
-            # the inner SW of the executed GP command, from the compact PoR
+            # The inner SW of the executed GP command, from the compact PoR.
+            # PoR 00 only says the PACKET was accepted - MAC, counter and TAR
+            # all good - and says nothing about what the card manager did with
+            # the command inside it. Without that status word there is nothing
+            # to support a claim that the step worked, so the run stops instead
+            # of loading on top of it. (MslScript does the same, for the same
+            # reason.)
             last_sw = getattr(sender, "last_inner_sw", None)
-            print("  %-42s PoR 00%s" % (name, "" if last_sw is None else ", card SW %s" % last_sw))
-            if last_sw is not None and last_sw != "9000":
+            if last_sw is None:
+                print("  %-42s PoR 00" % name)
+                print("STOPPED at %s: the response carried no status word for the command inside "
+                      "it, so this run cannot show the command itself worked." % name)
+                return 1
+            print("  %-42s PoR 00, card SW %s" % (name, last_sw))
+            if last_sw != "9000":
                 print("STOPPED: the card manager answered %s to %s" % (last_sw, name))
                 return 1
         print()
         print("DONE: CAP loaded and applet installed.")
         if args.grant_tar:
             print("Verify its MSL with: discover --tar %s" % args.grant_tar[0])
+        return 0
+    finally:
+        reader.close()
+
+
+# ---------------------------------------------------------------------------
+# Card content management over OTA: browse and delete
+# ---------------------------------------------------------------------------
+
+def ram_step(sender, apdu, one_higher=False):
+    """
+    One card content management APDU inside a secured packet to the card
+    manager, and what came back.
+
+    Returns (result, ram). Two status words matter and they are different
+    things: result.status is the PoR -- 00 means the packet was accepted, MAC
+    and counter and TAR all good -- while ram["sw"] is what the card manager
+    did with the command inside it. A refused INSTALL arrives inside a
+    perfectly good PoR 00.
+    """
+    sender.payload = apdu
+    probe = m.Probe(m.INTEGRITY_CC, m.CIPHER_OFF,
+                    m.COUNTER_ONE_HIGHER if one_higher else m.COUNTER_HIGHER)
+    result = sender(probe)
+    return result, getattr(sender, "last_ram", None)
+
+
+def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
+    """
+    GET STATUS over RAM, following the card's 6310 continuations.
+
+    6310 is "there is more, ask again with P2 next-occurrence". Each round is
+    another packet and another step of the OTA counter, so the walk is bounded:
+    a card that answered 6310 forever would otherwise empty the counter space.
+    """
+    entries = []
+    next_occurrence = False
+
+    for _ in range(rounds):
+        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence)
+        result, ram = ram_step(sender, apdu, one_higher)
+
+        if result.status != 0x00:
+            print("  the packet was not accepted (PoR %s) -- nothing was read"
+                  % ("none" if result.status is None else "%02X" % result.status))
+            return entries, False
+        if ram is None:
+            print("  PoR 00 with no response data: this key set reaches the card manager but it "
+                  "executed nothing this tool can read")
+            return entries, False
+        if ram["sw"] == 0x6A88:
+            # An empty section, not a failure: the scope WAS read and the card
+            # has nothing in it. Reporting this as unreadable would send the
+            # delete job looking for a problem that is not there.
+            print("  6A88: the card has nothing in this scope - an empty section, not an error")
+            return entries, True
+        if ram["sw"] not in (0x9000, 0x6310):
+            print("  the card manager answered %04X to GET STATUS" % ram["sw"])
+            return entries, False
+
+        entries += m.parse_registry(ram["data"], scope)
+        if ram["sw"] != 0x6310:
+            return entries, True
+
+        print("  6310: more entries in this scope, asking for the next ones")
+        next_occurrence = True
+
+    print("  stopped after %d continuations - the card kept saying 6310, so this listing is "
+          "incomplete" % rounds)
+    return entries, True
+
+
+def command_browse(args):
+    """
+    List what is on the card: applet instances, packages and their modules.
+    Read-only, over OTA (RAM).
+
+    This is the job to run before an install or a delete. There is no command
+    that reads an applet's install parameters back -- so no MSL comes out of
+    here -- but GET STATUS does give the AIDs, the life cycle states and the
+    module AIDs, which is what an INSTALL needs and what nobody can read off a
+    CAP they do not have.
+    """
+    scopes = []
+    if args.isd:
+        scopes.append(m.STATUS_ISSUER_SECURITY_DOMAIN)
+    if not args.no_applications:
+        scopes.append(m.STATUS_APPLICATIONS)
+    if not args.no_packages:
+        scopes.append(m.STATUS_LOAD_FILES_AND_MODULES)
+    if not scopes:
+        raise SystemExit("nothing to list: drop one of --no-applications / --no-packages")
+
+    reader, sender = open_sender(args)
+    sender.tar = unhex(args.tar)
+    total = 0
+    try:
+        for scope in scopes:
+            print()
+            print("GET STATUS - %s" % m.status_scope_label(scope))
+            entries, _ = ram_get_status(sender, scope, one_higher=args.allow_one_higher)
+            for entry in entries:
+                print("  %s" % entry.describe(scope))
+                for module in entry.modules:
+                    print("      module %s" % hexs(module))
+            print("  %d entr%s" % (len(entries), "y" if len(entries) == 1 else "ies"))
+            total += len(entries)
+
+        print()
+        print("counter: the card's last reported value was %s - start the next run above it"
+              % (sender.card_counter if sender.card_counter is None
+                 else "%010X" % sender.card_counter))
+        return 0 if total else 1
+    finally:
+        reader.close()
+
+
+def command_delete(args):
+    """
+    DELETE an applet instance or a package, over OTA (RAM). IRREVERSIBLE.
+
+    Default is a dry run. With --confirm the registry is read first and the
+    DELETE is refused when the card does not have that AID at all: a DELETE at
+    a mistyped AID can only answer 6A88, and hearing that before the send is
+    the point. --related is DELETE with P2 80, which for a package takes every
+    instance made from it as well.
+    """
+    aid = unhex(args.aid)
+    apdu = m.build_delete_apdu(aid, args.related)
+
+    print("AID to delete   : %s" % hexs(aid))
+    print("related objects : %s" % ("YES - the object AND everything related to it"
+                                    if args.related else "no - that object only"))
+    print("DELETE APDU     : %s" % hexs(apdu))
+    print("card manager    : TAR %s, KVN %s, %s" % (args.tar.upper(), args.kvn.upper(), args.alg))
+    print()
+
+    if not args.confirm:
+        print("DRY RUN: nothing was sent. Re-run with --confirm to delete.")
+        print("This is IRREVERSIBLE - a deleted instance takes its install parameters, and so the")
+        print("MSL this tool measures, with it. Prefer a disposable test card.")
+        return 0
+
+    reader, sender = open_sender(args)
+    sender.tar = unhex(args.tar)
+    try:
+        print("what is at that AID now:")
+        found = []
+        for scope in (m.STATUS_APPLICATIONS, m.STATUS_LOAD_FILES_AND_MODULES):
+            entries, read = ram_get_status(sender, scope, aid,
+                                           one_higher=args.allow_one_higher)
+            for entry in entries:
+                if entry.aid == aid:
+                    print("  %s" % entry.describe(scope))
+                    found.append(scope)
+            if not read:
+                print("  the registry could not be read for %s" % m.status_scope_label(scope))
+
+        if not found:
+            print("REFUSED: %s is in neither the application nor the package registry, so a "
+                  "DELETE for it can only answer 6A88. Run browse and check the AID."
+                  % hexs(aid))
+            return 2
+        if m.STATUS_LOAD_FILES_AND_MODULES in found and not args.related:
+            print("note: that AID is a package. If any instance was made from it, this DELETE is "
+                  "refused unless --related is given.")
+
+        print()
+        print("sending DELETE to the card manager, TAR %s" % args.tar.upper())
+        result, ram = ram_step(sender, apdu, args.allow_one_higher)
+
+        if result.status != 0x00:
+            print("the packet was not accepted (PoR %s): nothing was deleted"
+                  % ("none" if result.status is None else "%02X" % result.status))
+            return 1
+        if ram is None:
+            print("PoR 00, but no status word for the DELETE came back - browse the card to find "
+                  "out whether it happened")
+            return 1
+        if ram["sw"] != 0x9000:
+            print("the card manager answered %04X: nothing was deleted" % ram["sw"])
+            if ram["sw"] == 0x6985:
+                print("6985 is usually a package that still has instances (try --related) or an "
+                      "applet the issuer made undeletable")
+            return 1
+
+        print("DONE: %s is gone%s" % (hexs(aid),
+                                      ", with everything related to it" if args.related else ""))
         return 0
     finally:
         reader.close()
@@ -749,13 +959,35 @@ def main():
     add_card_arguments(sub)   # --tar is the card manager TAR (000000), + key/counter
     sub.set_defaults(func=command_ota_install, tar_default="000000")
 
+    sub = subparsers.add_parser("browse",
+                                help="list the applets and packages on the card (read-only)")
+    sub.add_argument("--no-applications", dest="no_applications", action="store_true",
+                     help="skip the applet instances and security domains")
+    sub.add_argument("--no-packages", dest="no_packages", action="store_true",
+                     help="skip the packages and their modules")
+    sub.add_argument("--isd", action="store_true",
+                     help="also list the issuer security domain itself and its life cycle")
+    add_card_arguments(sub)   # --tar is the card manager TAR (000000)
+    sub.set_defaults(func=command_browse)
+
+    sub = subparsers.add_parser("delete",
+                                help="delete an applet instance or a package - IRREVERSIBLE")
+    sub.add_argument("--aid", required=True, help="the instance or package AID to delete, hex")
+    sub.add_argument("--related", action="store_true",
+                     help="DELETE with P2 80: the object AND everything related to it (for a "
+                          "package, every instance made from it)")
+    sub.add_argument("--confirm", action="store_true",
+                     help="actually send (IRREVERSIBLE); without it, a dry run")
+    add_card_arguments(sub)   # --tar is the card manager TAR (000000)
+    sub.set_defaults(func=command_delete)
+
     args = parser.parse_args()
     if not getattr(args, "func", None):
         parser.print_help()
         return 2
-    if args.command in ("verify", "discover") or (args.command in ("install", "ota-install")
-                                                  and args.confirm
-                                                  and not getattr(args, "print_only", False)):
+    if args.command in ("verify", "discover", "browse") or (
+            args.command in ("install", "ota-install", "delete")
+            and args.confirm and not getattr(args, "print_only", False)):
         if DES3 is None:
             raise SystemExit("pycryptodomex is not installed: pip install pycryptodomex")
     return args.func(args)
