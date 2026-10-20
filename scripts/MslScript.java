@@ -886,6 +886,78 @@ public class MslScript extends SCP02Script
      * another packet and another counter step, so the walk is bounded: a card
      * that answers 6310 forever would otherwise empty the counter space.
      */
+    /**
+     * The GET STATUS form this card accepts. -1 until one has answered, then
+     * reused for every later scope and continuation in the run.
+     */
+    private int statusForm = -1;
+
+    /**
+     * GET STATUS over RAM, in a form this card will actually act on.
+     *
+     * Two things cards disagree about - the trailing Le and the response
+     * format - and neither can be settled from a specification. The MCI/Hamrah
+     * card answered 6F00 to the form every other card here accepts, and said
+     * why in its own response: two commands executed where one was sent. It had
+     * read the Le byte as the start of a second command, and the compact
+     * response format reports only the last command's status, so the GET STATUS
+     * answer was discarded.
+     *
+     * So the forms are tried in turn until one is accepted, and the one that
+     * worked is remembered. A scope that is simply empty (6A88) still tells us
+     * the form was understood, so it counts as success here.
+     */
+    private Ram getStatusOverRam(Sender sender, int scope, byte[] filter, boolean next)
+    {
+        if (statusForm >= 0)
+        {
+            return sender.exchange(MslCore.buildGetStatusApdu(scope, filter, next,
+                MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm)));
+        }
+
+        Ram answer = null;
+        for (int i = 0; i < MslCore.STATUS_FORMS.length; i++)
+        {
+            int form = MslCore.STATUS_FORMS[i];
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
+                MslCore.statusFormIsTlv(form), MslCore.statusFormHasLe(form));
+
+            out.step("trying " + MslCore.statusFormLabel(form) + ": " + MslCore.hex(apdu));
+            answer = sender.exchange(apdu);
+
+            // A packet the card would not take says nothing about the form, so
+            // there is no point walking the rest of them.
+            if (!answer.packetAccepted() || answer.inner == null) { return answer; }
+
+            int status = answer.inner.statusWord;
+            if (status == 0x9000 || status == 0x6310 || status == 0x6A88)
+            {
+                statusForm = form;
+                out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
+                return answer;
+            }
+            out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
+                     + extraCommands(answer));
+        }
+        return answer;
+    }
+
+    /**
+     * The card's own evidence that an APDU carried more than one command.
+     *
+     * The compact RAM response counts the commands the card executed. More than
+     * one from a script carrying one means the card read trailing bytes as
+     * another command - which is exactly how a stray Le byte throws away the
+     * answer to the command that mattered.
+     */
+    private String extraCommands(Ram answer)
+    {
+        if (answer == null || answer.inner == null || answer.inner.commands <= 1) { return ""; }
+
+        return " - and reported " + answer.inner.commands + " commands executed where one was "
+            + "sent, so it read trailing bytes as a second command";
+    }
+
     private int listOverRam(Sender sender, int scope)
     {
         out.heading("GET STATUS - " + MslCore.statusScopeLabel(scope) + " (over RAM)");
@@ -895,10 +967,7 @@ public class MslScript extends SCP02Script
 
         for (int round = 0; round < 8; round++)
         {
-            byte[] apdu = MslCore.buildGetStatusApdu(scope, new byte[0], next, false);
-            out.step("sending " + MslCore.hex(apdu));
-
-            Ram answer = sender.exchange(apdu);
+            Ram answer = getStatusOverRam(sender, scope, new byte[0], next);
             if (!answer.packetAccepted())
             {
                 out.error(answer.describe());
@@ -913,15 +982,21 @@ public class MslScript extends SCP02Script
             }
 
             int status = answer.inner.statusWord;
+            if (status == 0x6A88)
+            {
+                // An empty section, not a failure: the card understood the
+                // command and has nothing in this scope.
+                out.info("6A88: the card has nothing in this scope - an empty registry section, "
+                         + "not an error.");
+                return total;
+            }
             if (status != 0x9000 && status != 0x6310)
             {
                 out.error("the card manager answered " + MslCore.hexWord(status)
-                          + " to GET STATUS");
-                if (status == 0x6A88)
-                {
-                    out.info("6A88 here means the card has nothing in this scope - an empty "
-                             + "registry section, not an error.");
-                }
+                          + " to GET STATUS" + extraCommands(answer));
+                out.info("Every GET STATUS form this tool knows was refused. The key set reaches "
+                         + "the card manager - the packet was accepted - so this is the card "
+                         + "refusing card content management to it, not a transport problem.");
                 return total;
             }
 
@@ -1065,8 +1140,7 @@ public class MslScript extends SCP02Script
     /** True when a GET STATUS over RAM, filtered on this AID, finds it. */
     private boolean ramRegistryHolds(Sender sender, int scope, byte[] aid)
     {
-        byte[] apdu = MslCore.buildGetStatusApdu(scope, aid, false, false);
-        Ram answer = sender.exchange(apdu);
+        Ram answer = getStatusOverRam(sender, scope, aid, false);
 
         if (!answer.packetAccepted() || answer.inner == null)
         {
@@ -1117,7 +1191,12 @@ public class MslScript extends SCP02Script
      */
     private void deleteObject()
     {
-        byte[] apdu = MslCore.buildDeleteApdu(cfg.deleteAid, cfg.deleteRelatedObjects);
+        // Over a contact channel DELETE is a case 4 command and carries its Le;
+        // inside a secured packet it must not, or the card reads that byte as
+        // the start of another command (which is what it did to GET STATUS).
+        boolean overSecureChannel = cfg.transport == MslConfig.TRANSPORT_ISD;
+        byte[] apdu = MslCore.buildDeleteApdu(cfg.deleteAid, cfg.deleteRelatedObjects,
+                                              overSecureChannel);
 
         out.heading("What would be deleted");
         out.info("AID              : " + MslCore.hex(cfg.deleteAid));

@@ -731,6 +731,55 @@ def ram_step(sender, apdu, one_higher=False):
     return result, getattr(sender, "last_ram", None)
 
 
+def extra_commands(ram):
+    """
+    The card's own evidence that an APDU carried more than one command.
+
+    The compact RAM response counts the commands executed. More than one from a
+    script carrying one means the card read trailing bytes as another command --
+    which is exactly how a stray Le byte throws away the answer that mattered.
+    """
+    if not ram or ram.get("commands", 1) <= 1:
+        return ""
+    return (" -- and reported %d commands executed where one was sent, so it read trailing "
+            "bytes as a second command" % ram["commands"])
+
+
+def ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher):
+    """
+    One GET STATUS, in a form this card will actually act on.
+
+    Two things cards disagree about -- the trailing Le and the response format
+    -- and neither can be settled from a specification. So the forms are tried
+    in turn until one is accepted, and the one that worked is remembered on the
+    sender for the rest of the run. A scope that is simply empty (6A88) still
+    shows the form was understood, so it counts here.
+    """
+    chosen = getattr(sender, "status_form", None)
+    if chosen is not None:
+        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence,
+                                       m.status_form_is_tlv(chosen),
+                                       m.status_form_has_le(chosen))
+        return ram_step(sender, apdu, one_higher)
+
+    result = ram = None
+    for form in m.STATUS_FORMS:
+        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence,
+                                       m.status_form_is_tlv(form), m.status_form_has_le(form))
+        print("  trying %s: %s" % (m.status_form_label(form), hexs(apdu)))
+        result, ram = ram_step(sender, apdu, one_higher)
+
+        # A packet the card would not take says nothing about the form.
+        if result.status != 0x00 or ram is None:
+            return result, ram
+        if ram["sw"] in (0x9000, 0x6310, 0x6A88):
+            sender.status_form = form
+            print("  this card wants GET STATUS %s" % m.status_form_label(form))
+            return result, ram
+        print("  the card answered %04X to that form%s" % (ram["sw"], extra_commands(ram)))
+    return result, ram
+
+
 def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
     """
     GET STATUS over RAM, following the card's 6310 continuations.
@@ -743,8 +792,7 @@ def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
     next_occurrence = False
 
     for _ in range(rounds):
-        apdu = m.build_get_status_apdu(scope, aid_filter, next_occurrence)
-        result, ram = ram_step(sender, apdu, one_higher)
+        result, ram = ram_get_status_once(sender, scope, aid_filter, next_occurrence, one_higher)
 
         if result.status != 0x00:
             print("  the packet was not accepted (PoR %s) -- nothing was read"
@@ -761,7 +809,11 @@ def ram_get_status(sender, scope, aid_filter=b"", rounds=8, one_higher=False):
             print("  6A88: the card has nothing in this scope - an empty section, not an error")
             return entries, True
         if ram["sw"] not in (0x9000, 0x6310):
-            print("  the card manager answered %04X to GET STATUS" % ram["sw"])
+            print("  the card manager answered %04X to GET STATUS%s"
+                  % (ram["sw"], extra_commands(ram)))
+            print("  Every GET STATUS form this tool knows was refused. The packet WAS accepted, "
+                  "so the key set reaches the card manager - this is the card refusing card "
+                  "content management to it, not a transport problem.")
             return entries, False
 
         entries += m.parse_registry(ram["data"], scope)

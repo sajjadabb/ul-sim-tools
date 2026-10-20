@@ -183,10 +183,42 @@ class SimulatedCard(object):
             return None                       # too low: silently dropped
         self.counter = counter
 
-        status_word, response = self._execute(payload)
-        return self._response_packet(tar, status_word, response)
+        commands, status_word, response = self._command_script(payload)
+        return self._response_packet(tar, commands, status_word, response)
 
-    def _response_packet(self, tar, status_word, response):
+    def _command_script(self, script):
+        """
+        The secured data of a RAM packet is a COMMAND SCRIPT: a sequence of
+        case 3 APDUs, each CLA INS P1 P2 Lc DATA. The card walks it, executes
+        each one, and reports how many it executed plus the last one's status.
+
+        Strict on purpose, because the real card is: given a GET STATUS with a
+        trailing Le byte, the MCI/Hamrah card answered "2 commands executed,
+        last one 6F00". It had read that 00 as the start of another command.
+        A simulator that quietly accepted the whole payload as one APDU would
+        have hidden exactly the bug this reproduces.
+        """
+        data = bytearray(script)
+        pos = 0
+        executed = 0
+        status, response = 0x6F00, b""
+
+        while pos < len(data):
+            if pos + 5 > len(data) or pos + 5 + data[pos + 4] > len(data):
+                # A fragment that is not a whole APDU is still a command the
+                # card tried to execute, and it is the LAST one - which is why
+                # the answer to the real command gets thrown away.
+                executed += 1
+                return executed, 0x6F00, b""
+
+            end = pos + 5 + data[pos + 4]
+            status, response = self._execute(bytes(data[pos:end]))
+            executed += 1
+            pos = end
+
+        return executed, status, response
+
+    def _response_packet(self, tar, commands, status_word, response):
         """
         02 71 00 | RPL(2) RHL(1) TAR(3) CNTR(5) PCNTR(1) STATUS(1) <additional>
 
@@ -196,8 +228,8 @@ class SimulatedCard(object):
         sends those three bytes - which is what lets a caller tell a refused
         command inside an accepted packet from a successful one.
         """
-        additional = bytes(bytearray([1, (status_word >> 8) & 0xFF, status_word & 0xFF])) \
-            + bytes(response)
+        additional = bytes(bytearray([commands, (status_word >> 8) & 0xFF,
+                                      status_word & 0xFF])) + bytes(response)
         if self.omit_additional_data:
             additional = b""
 
@@ -526,6 +558,66 @@ check("every browse packet was a GET STATUS and nothing else",
 check("browse changed nothing on the card",
       card.deleted == [] and card.installed == [] and not card.load_complete)
 check("browse reports where the card's counter ended up", "counter:" in out, out)
+
+# The bug the real card found, kept as a regression: a GET STATUS carrying its
+# Le byte is TWO commands to a card that walks the script strictly, and since
+# the compact response reports only the last one, the answer that mattered is
+# thrown away. The MCI/Hamrah card answered exactly this: 2 commands, 6F00.
+card = SimulatedCard()
+with_le = m.build_get_status_apdu(m.STATUS_APPLICATIONS, b"", False, False, True)
+check("a GET STATUS with Le reads as two commands, the last one 6F00",
+      card._command_script(with_le) == (2, 0x6F00, b""),
+      str(card._command_script(with_le)))
+without_le = m.build_get_status_apdu(m.STATUS_APPLICATIONS)
+# By length, not by looking at the last byte: an AID or a length field can be
+# 00 itself, which is how a check like that passes while the bug is still there.
+check("the default form carries no Le, so it is one command",
+      len(without_le) == 5 + 2, hexs(without_le))
+check("that one command is the GET STATUS itself",
+      card._command_script(without_le)[0] == 1, str(card._command_script(without_le)))
+check("DELETE defaults to no Le too - the same trap, the same card",
+      len(m.build_delete_apdu(INSTANCE)) == 5 + 2 + len(INSTANCE),
+      hexs(m.build_delete_apdu(INSTANCE)))
+check("asking for Le explicitly still appends exactly one byte",
+      m.build_delete_apdu(INSTANCE, False, True)
+      == m.build_delete_apdu(INSTANCE) + b"\x00")
+
+
+def tlv_registry(compact, scope):
+    """Re-encodes a compact registry as GlobalPlatform 2.2 E3 templates."""
+    out = bytearray()
+    for entry in m.parse_registry_compact(compact, scope):
+        body = bytearray([0x4F, len(entry.aid)]) + bytearray(entry.aid)
+        if entry.life_cycle is not None:
+            body += bytearray([0x9F, 0x70, 0x01, entry.life_cycle])
+        if entry.privileges:
+            body += bytearray([0xC5, len(entry.privileges)]) + bytearray(entry.privileges)
+        for module in entry.modules:
+            body += bytearray([0x84, len(module)]) + bytearray(module)
+        out += bytearray([0xE3, len(body)]) + body
+    return bytes(out)
+
+
+class WantsTlvFormat(SimulatedCard):
+    """A GlobalPlatform 2.2 card that refuses the deprecated response format."""
+
+    def _get_status(self, data):
+        if not (data[3] & 0x02):
+            return 0x6A86, b""                    # incorrect P1 P2
+        status, registry = SimulatedCard._get_status(self, data)
+        return status, tlv_registry(registry, data[2])
+
+
+card = WantsTlvFormat(applications={bytes(USIM): 0x07})
+code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
+                       "--no-packages"])
+check("a card that refuses the deprecated format is not reported as empty", code == 0, out)
+check("the run walks the GET STATUS forms until one is accepted",
+      "6A86" in out and "trying" in out, out)
+check("it says which form this card wanted", "TLV response format" in out, out)
+check("and it lists the registry in that format", hexs(USIM) in out, out)
+check("the accepted form is reused rather than rediscovered",
+      out.count("this card wants GET STATUS") == 1, out)
 
 card = SimulatedCard(applications={bytes(USIM): 0x07}, load_files={bytes(ELF): 0x01})
 code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",

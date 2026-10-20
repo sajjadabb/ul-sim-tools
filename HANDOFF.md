@@ -55,14 +55,14 @@ lib/        shared by the UL scripts (compiled against the SDK)
 scripts/
   MslScript.java      ONE script, all six jobs; job chosen in the dialog
 selftest/
-  MslSelfTest.java    390 card-free Java checks
+  MslSelfTest.java    399 card-free Java checks
 tools/        normal mode (Python + pyscard), no UL licence
   mslcore.py          Python twin of MslCore + MslProbing (ports of each other)
   msl_tool.py         CLI: packet build, envelope, PoR parse, the jobs, ota-install
   capload.py          CAP -> GP Load File -> INSTALL[for load] + LOAD blocks + INSTALL[for install]
   msl_ui.py + ui/index.html  the HTML desktop app (pywebview); selftest_ui.py
-  selftest_msl.py (397)  selftest_capload.py (26)
-  selftest_ram.py (68)   end-to-end: browse/delete/ota-install against a simulated
+  selftest_msl.py (406)  selftest_capload.py (26)
+  selftest_ram.py (78)   end-to-end: browse/delete/ota-install against a simulated
                          card that unwraps the packets and answers like a card manager
 app/        MSL Checker.exe (PyInstaller build of msl_ui.py)
 docs/       UL-TEST-GUIDE-FA.md, USER_MANUAL_FA.html
@@ -72,7 +72,7 @@ reports/    generated run reports
 ### Build / deploy / test
 ```bash
 # full offline gate (run after EVERY edit; the operator's CLAUDE.md requires it)
-./selftest.sh          # Java 390, Python 397, UI 38, capload 26, RAM 68 — all must pass
+./selftest.sh          # Java 399, Python 406, UI 38, capload 26, RAM 78 — all must pass
 
 # compile + deploy to the UL folder so UL picks up changes
 OUT="C:/Users/user/OneDrive/Documents/TAR/Clases" ./build.sh lib/*.java scripts/*.java
@@ -118,6 +118,18 @@ loaded class for the whole session; re-running a script does NOT reload it.
    first live UL run.
 3. **No PoR without a valid MAC.** The real key is required; a dummy key drops
    silently. (Differs from the earlier ECI card which answered 0A pre-MAC.)
+4. **A RAM command script is case 3 APDUs — no Le.** Confirmed live 2026-10-20:
+   a GET STATUS sent as `80 F2 40 00 02 4F 00 00` came back PoR 00 with
+   additional data `02 6F 00` — *two* commands executed from a script carrying
+   one. The card read the trailing `00` as the start of a second, malformed
+   command, and because the compact response format reports only the LAST
+   command's status and data, the real GET STATUS answer was discarded. Drop
+   the Le and the same command works. `MslCore.buildGetStatusApdu` and
+   `buildDeleteApdu` now default to no-Le, the contact/SCP02 path asks for it
+   explicitly, and `MslScript.browse` walks the four forms (Le × response
+   format) until the card accepts one and then stays with it.
+   **Read the command count in every PoR**: more commands than were sent is the
+   card telling you an APDU carried bytes it read as another command.
 
 ---
 
@@ -154,12 +166,13 @@ loaded class for the whole session; re-running a script does NOT reload it.
 
 | Thing | Status |
 |---|---|
-| Offline gate (915 checks) | ✅ all green |
+| Offline gate (943 checks) | ✅ all green |
 | Python engine on live card (discover, 5 applets = MSL 12) | ✅ live |
 | UL `MslScript` discover on live card (USIM B00011 = MSL 12, PASS) | ✅ live (after the 61xx fix) |
 | silent-drop + KIc/KID split | ✅ live + tested |
 | ota-install packet construction (dry run, real CAP) | ✅ built + 26 tests |
-| Card manager reachable over OTA with the key (GET STATUS) | ✅ live PoR 00 |
+| Card manager reachable over OTA with the key (GET STATUS) | ✅ live PoR 00 — but see below: the PoR was 00 while the command itself answered 6F00, which earlier sessions did not check |
+| browse in UL on the live card (packet accepted, inner SW read) | ⚠️ 2026-10-20: transport proven end to end (TERMINAL PROFILE 9000, PoR 00, counter echoed); GET STATUS answered 6F00 because of the Le byte — fixed, not yet re-run |
 | **ota-install actually sending (irreversible)** | ❌ NOT run — awaiting operator go |
 | ota-install / browse / delete ported to UL (Java) | ✅ built + 104 new offline checks; ❌ never compiled against the real SDK jar, never run in UL |
 | Java CAP loader vs Python capload.py (same CAP, 3 block sizes) | ✅ byte-identical (differential harness) |

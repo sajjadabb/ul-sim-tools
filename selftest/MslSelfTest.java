@@ -899,16 +899,29 @@ public final class MslSelfTest
 
     private static void cardContentChecks()
     {
-        check("GET STATUS for applications is 80 F2 40 00 02 4F 00 00",
+        // No Le by default: over RAM a trailing byte is read as a second
+        // command. The card that proved it is in the wire vectors below.
+        check("GET STATUS for applications is 80 F2 40 00 02 4F 00, with no Le",
               MslCore.hex(MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS, new byte[0],
                                                      false, false))
-                     .equals("80F24000024F0000"),
+                     .equals("80F24000024F00"),
               MslCore.hex(MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS, new byte[0],
                                                      false, false)));
+        check("asking for Le explicitly appends exactly one byte",
+              MslCore.hex(MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS, new byte[0],
+                                                     false, false, true))
+                     .equals("80F24000024F0000"));
         check("an AID filter goes in tag 4F",
               MslCore.hex(MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS,
                                                      MslCore.unhex("A000000009"), false, false))
-                     .equals("80F2400007" + "4F05A000000009" + "00"));
+                     .equals("80F2400007" + "4F05A000000009"));
+        check("the GET STATUS forms are tried no-Le first",
+              MslCore.STATUS_FORMS[0] == 0
+              && !MslCore.statusFormHasLe(MslCore.STATUS_FORMS[0]));
+        check("the forms cover both axes: Le and response format",
+              MslCore.STATUS_FORMS.length == 4
+              && MslCore.statusFormIsTlv(2) && !MslCore.statusFormIsTlv(1)
+              && MslCore.statusFormHasLe(1) && !MslCore.statusFormHasLe(0));
         check("the next-occurrence continuation sets P2 bit b1",
               (MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS, new byte[0], true,
                                           false)[3] & 0xFF) == 0x01);
@@ -919,10 +932,13 @@ public final class MslSelfTest
               MslCore.scopeCarriesModules(MslCore.STATUS_LOAD_FILES_AND_MODULES)
               && !MslCore.scopeCarriesModules(MslCore.STATUS_LOAD_FILES));
 
-        check("DELETE of an instance is 80 E4 00 00, tag 4F, Le 00",
+        check("DELETE of an instance is 80 E4 00 00 with tag 4F and no Le",
               MslCore.hex(MslCore.buildDeleteApdu(MslCore.unhex("A000000009000102"), false))
-                     .equals("80E400000A" + "4F08A000000009000102" + "00"),
+                     .equals("80E400000A" + "4F08A000000009000102"),
               MslCore.hex(MslCore.buildDeleteApdu(MslCore.unhex("A000000009000102"), false)));
+        check("DELETE through a secure channel can still ask for its Le",
+              MslCore.hex(MslCore.buildDeleteApdu(MslCore.unhex("A000000009000102"), false, true))
+                     .equals("80E400000A" + "4F08A000000009000102" + "00"));
         check("DELETE with related objects sets P2 to 80 - the cascade, not a different command",
               (MslCore.buildDeleteApdu(MslCore.unhex("A000000009"), true)[3] & 0xFF) == 0x80);
         check("DELETE refuses an AID that is too short to be one",
@@ -1088,6 +1104,27 @@ public final class MslSelfTest
                   entry.modules.size() == 1
                   && MslCore.hex((byte[]) entry.modules.get(0)).equals("112233445500"));
         }
+
+        // A REAL response packet, off the MCI/Hamrah card on 2026-10-20,
+        // answering a GET STATUS that still carried its Le byte. The packet was
+        // accepted - PoR 00 - and the card still threw the answer away: it
+        // executed TWO commands, having read that trailing 00 as the start of
+        // another one, and the compact format reports only the last. This is
+        // the vector that justifies the no-Le default, and tools/selftest_ram.py
+        // reproduces the behaviour in its simulated card.
+        por = MslCore.parsePor(MslCore.unhex("027100" + "0016" + "12" + "000000"
+            + "0005000000" + "00" + "00" + "1F4D4F3509263305" + "026F00"));
+        check("the real card's packet was accepted - PoR 00",
+              por != null && por.status == 0x00);
+        check("its counter and TAR read back as sent",
+              por != null && MslCore.hex(por.counter).equals("0005000000")
+              && MslCore.hex(por.tar).equals("000000"));
+        ram = MslCore.parseRamResponse(por.responseData);
+        check("the card reported TWO commands executed where one was sent",
+              ram != null && ram.commands == 2, ram == null ? "" : String.valueOf(ram.commands));
+        check("the last of them answered 6F00, which is what reached the operator",
+              ram != null && ram.statusWord == 0x6F00 && !ram.ok());
+        check("and no registry data survived it", ram != null && ram.data.length == 0);
 
         // A DELETE that worked, and one for an AID the card does not have. Both
         // arrive inside an accepted packet, and only the inner word tells them
