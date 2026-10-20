@@ -941,6 +941,30 @@ public final class MslSelfTest
                      .equals("80E400000A" + "4F08A000000009000102" + "00"));
         check("DELETE with related objects sets P2 to 80 - the cascade, not a different command",
               (MslCore.buildDeleteApdu(MslCore.unhex("A000000009"), true)[3] & 0xFF) == 0x80);
+        // Inside a packet the card manager runs the script under T=0 rules: a
+        // command that produced data answers 61 xx and hands nothing over
+        // until a GET RESPONSE asks. The live card answered 6159 and 6160 -
+        // 89 and 96 bytes of registry waiting behind them.
+        check("61 xx and 6C xx are read as 'data is waiting', not as refusals",
+              MslCore.hasPendingData(0x6159) && MslCore.hasPendingData(0x6160)
+              && MslCore.hasPendingData(0x6C59));
+        check("a real status word is not mistaken for pending data",
+              !MslCore.hasPendingData(0x9000) && !MslCore.hasPendingData(0x6F00)
+              && !MslCore.hasPendingData(0x6310) && !MslCore.hasPendingData(0x6A88));
+        check("GET RESPONSE is 00 C0 00 00 Le",
+              MslCore.hex(MslCore.buildGetResponseApdu(0x59)).equals("00C0000059"));
+        check("GET RESPONSE refuses a length no APDU can carry",
+              raises(new Block()
+              {
+                  public void run() { MslCore.buildGetResponseApdu(256); }
+              }));
+        check("a command script is its APDUs end to end, nothing added",
+              MslCore.hex(MslCore.commandScript(
+                  MslCore.buildGetStatusApdu(MslCore.STATUS_APPLICATIONS, new byte[0],
+                                             false, false),
+                  MslCore.buildGetResponseApdu(0x59)))
+                     .equals("80F24000024F00" + "00C0000059"));
+
         check("DELETE refuses an AID that is too short to be one",
               raises(new Block()
               {

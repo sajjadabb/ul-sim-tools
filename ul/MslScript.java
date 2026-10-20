@@ -1223,6 +1223,48 @@ final class MslCore
         return hexByte(status >> 8) + hexByte(status);
     }
 
+    /**
+     * GET RESPONSE, for the command script that needs one.
+     *
+     * Inside a secured packet the card manager runs the script under T=0
+     * rules: a command that produced data answers 61 xx - "xx bytes are
+     * waiting" - and the data is only handed over to a GET RESPONSE. There is
+     * no transport layer underneath to do that automatically the way there is
+     * on a contact channel, so the script has to carry it as the next command.
+     *
+     * Confirmed live on the MCI/Hamrah card: GET STATUS without Le answered
+     * 6159 (89 bytes of registry waiting) where the same command with an Le
+     * byte answered 6F00. The 61 xx was never a refusal - it was the card
+     * asking to be read.
+     */
+    public static byte[] buildGetResponseApdu(int length)
+    {
+        if (length < 0 || length > 0xFF)
+        {
+            throw new IllegalArgumentException("GET RESPONSE takes 0 to 255 bytes, not " + length);
+        }
+        return new byte[] { 0x00, (byte) 0xC0, 0x00, 0x00, (byte) length };
+    }
+
+    /**
+     * Two APDUs as one command script.
+     *
+     * A RAM command script is simply case 3 APDUs end to end; the card walks it
+     * and reports how many it executed plus the last one's status and data.
+     * That last-one rule is what makes the pairing work: the GET RESPONSE is
+     * last, so its data is what comes back.
+     */
+    public static byte[] commandScript(byte[] first, byte[] second)
+    {
+        return concat(first, second);
+    }
+
+    /** True when a status word is a card asking to be read: 61 xx or 6C xx. */
+    public static boolean hasPendingData(int status)
+    {
+        return (status & 0xFF00) == 0x6100 || (status & 0xFF00) == 0x6C00;
+    }
+
     // ------------------------------------------------------------------
     // What a RAM response packet carries
     // ------------------------------------------------------------------
@@ -6209,6 +6251,7 @@ public class MslScript extends SCP02Script
             {
                 found += listOverSecureChannel(((Integer) scopes.get(i)).intValue());
             }
+            summariseBrowse();
             recordBrowse(found);
             return;
         }
@@ -6222,6 +6265,8 @@ public class MslScript extends SCP02Script
         {
             found += listOverRam(sender, ((Integer) scopes.get(i)).intValue());
         }
+
+        summariseBrowse();
 
         out.heading("Counter");
         out.info("This run sent " + sender.sent + " packet(s). The last PoR reported "
@@ -6275,8 +6320,9 @@ public class MslScript extends SCP02Script
     {
         if (statusForm >= 0)
         {
-            return sender.exchange(MslCore.buildGetStatusApdu(scope, filter, next,
-                MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm)));
+            byte[] apdu = MslCore.buildGetStatusApdu(scope, filter, next,
+                MslCore.statusFormIsTlv(statusForm), MslCore.statusFormHasLe(statusForm));
+            return readPendingData(sender, apdu, sender.exchange(apdu));
         }
 
         Ram answer = null;
@@ -6294,14 +6340,60 @@ public class MslScript extends SCP02Script
             if (!answer.packetAccepted() || answer.inner == null) { return answer; }
 
             int status = answer.inner.statusWord;
-            if (status == 0x9000 || status == 0x6310 || status == 0x6A88)
+            if (status == 0x9000 || status == 0x6310 || status == 0x6A88
+                || MslCore.hasPendingData(status))
             {
+                // 61 xx is not a refusal: it is the card saying the command ran
+                // and its data is waiting to be read. The form is good.
                 statusForm = form;
                 out.good("this card wants GET STATUS " + MslCore.statusFormLabel(form));
-                return answer;
+                return readPendingData(sender, apdu, answer);
             }
             out.warn("the card answered " + MslCore.hexWord(status) + " to that form"
                      + extraCommands(answer));
+        }
+        return answer;
+    }
+
+    /**
+     * Reads data the card said was waiting, by re-sending the command with a
+     * GET RESPONSE after it in the same script.
+     *
+     * Inside a secured packet there is no transport layer to do this: the card
+     * manager runs the script under T=0 rules, so a command that produced data
+     * answers 61 xx and hands nothing over until a GET RESPONSE asks for it.
+     * Since the compact response format reports only the LAST command's data,
+     * putting the GET RESPONSE last is exactly what makes the answer come back.
+     *
+     * The command is repeated rather than the GET RESPONSE sent alone: whether
+     * a card keeps its pending response between two secured packets is not
+     * something any specification promises, and a run that assumed it would
+     * silently read nothing.
+     *
+     * One retry, for the card that answers 6C yy - "wrong length, ask for yy".
+     */
+    private Ram readPendingData(Sender sender, byte[] command, Ram answer)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (answer == null || answer.inner == null) { return answer; }
+
+            int status = answer.inner.statusWord;
+            if (!MslCore.hasPendingData(status)) { return answer; }
+
+            int length = status & 0xFF;
+            out.info(MslCore.hexWord(status) + ": the card has " + length + " byte(s) waiting, "
+                     + "so the script is sent again with a GET RESPONSE after the command");
+
+            byte[] script = MslCore.commandScript(command,
+                                                  MslCore.buildGetResponseApdu(length));
+            answer = sender.exchange(script);
+
+            if (answer.inner != null && answer.inner.commands < 2 && answer.packetAccepted())
+            {
+                out.warn("the card reported " + answer.inner.commands + " command(s) executed for "
+                         + "a two-command script - it may not accept a GET RESPONSE inside one");
+            }
         }
         return answer;
     }
@@ -6450,17 +6542,29 @@ public class MslScript extends SCP02Script
             if (!entry.hasAID()) { continue; }
 
             int lifeCycle = entry.hasLifeCycleState() ? (entry.getLifeCycleState()[0] & 0xFF) : -1;
-            out.info(MslCore.hex(entry.getAID())
-                     + (lifeCycle < 0 ? ""
-                        : "  life cycle " + MslCore.hexByte(lifeCycle) + " ("
-                          + MslCore.lifeCycleName(scope, lifeCycle) + ")"));
-            report.note(MslCore.statusScopeLabel(scope) + ": " + MslCore.hex(entry.getAID()));
+
+            // Carried into the same shape the OTA road produces, so the summary
+            // at the end reads identically whichever road the run took.
+            MslCore.Registry collected = new MslCore.Registry();
+            collected.aid = entry.getAID();
+            collected.lifeCycle = lifeCycle;
+
+            out.info(registryLine(collected, scope));
+            report.note(MslCore.statusScopeLabel(scope) + ": "
+                        + registryLine(collected, scope).trim());
+
+            if (scope == MslCore.STATUS_APPLICATIONS) { browsedApplications.add(collected); }
+            else { browsedLoadFiles.add(collected); }
         }
         out.info(entries.size() + " entr" + (entries.size() == 1 ? "y" : "ies"));
         return entries.size();
     }
 
-    /** Prints one GET STATUS response, whichever format the card used. */
+    /** Every application entry this run read, and every load file, for the summary. */
+    private final List browsedApplications = new ArrayList();
+    private final List browsedLoadFiles = new ArrayList();
+
+    /** Prints one GET STATUS response as a table, whichever format the card used. */
     private int printRegistry(byte[] data, int scope)
     {
         if (data == null || data.length == 0)
@@ -6481,24 +6585,136 @@ public class MslScript extends SCP02Script
             return 0;
         }
 
-        for (int i = 0; i < entries.size(); i++)
-        {
-            MslCore.Registry entry = (MslCore.Registry) entries.get(i);
-            out.info(entry.describe(scope));
-            report.note(MslCore.statusScopeLabel(scope) + ": " + entry.describe(scope));
-
-            for (int j = 0; j < entry.modules.size(); j++)
-            {
-                out.info("    module " + MslCore.hex((byte[]) entry.modules.get(j)));
-            }
-        }
-
         if (entries.isEmpty())
         {
             out.info("raw: " + MslCore.hex(data));
             out.warn("the card answered, but nothing in the answer reads as a registry entry");
+            return 0;
+        }
+
+        out.info(pad("AID", 28) + pad("life cycle", 32) + "privileges");
+        out.info(pad("", 28 + 32 + 10).replace(' ', '-'));
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            MslCore.Registry entry = (MslCore.Registry) entries.get(i);
+            out.info(registryLine(entry, scope));
+            report.note(MslCore.statusScopeLabel(scope) + ": " + registryLine(entry, scope).trim());
+
+            for (int j = 0; j < entry.modules.size(); j++)
+            {
+                byte[] module = (byte[]) entry.modules.get(j);
+                out.info("    module  " + MslCore.hex(module));
+                report.note("    module " + MslCore.hex(module));
+            }
+
+            if (scope == MslCore.STATUS_APPLICATIONS)
+            {
+                browsedApplications.add(entry);
+            }
+            else if (MslCore.scopeCarriesModules(scope) || scope == MslCore.STATUS_LOAD_FILES)
+            {
+                browsedLoadFiles.add(entry);
+            }
         }
         return entries.size();
+    }
+
+    private String registryLine(MslCore.Registry entry, int scope)
+    {
+        String lifeCycle = entry.lifeCycle < 0
+            ? "not reported"
+            : MslCore.lifeCycleName(scope, entry.lifeCycle)
+              + " (" + MslCore.hexByte(entry.lifeCycle) + ")";
+
+        return pad(MslCore.hex(entry.aid), 28) + pad(lifeCycle, 32)
+            + (entry.privileges.length == 0 ? "" : MslCore.hex(entry.privileges));
+    }
+
+    /**
+     * What the card actually holds, said once at the end.
+     *
+     * The per-scope tables are the evidence; this is the answer. The package
+     * each instance came from is a GUESS and labelled as one: an instance AID
+     * usually begins with its package's AID, and GlobalPlatform does not
+     * require it, so nothing is decided on that basis - it is here because it
+     * is what an operator reads the listing to find out.
+     */
+    private void summariseBrowse()
+    {
+        out.heading("What is on this card");
+
+        int selectable = 0;
+        int lockedOrInstalled = 0;
+        for (int i = 0; i < browsedApplications.size(); i++)
+        {
+            MslCore.Registry entry = (MslCore.Registry) browsedApplications.get(i);
+            if (entry.lifeCycle == 0x07) { selectable++; } else { lockedOrInstalled++; }
+        }
+
+        int modules = 0;
+        for (int i = 0; i < browsedLoadFiles.size(); i++)
+        {
+            modules += ((MslCore.Registry) browsedLoadFiles.get(i)).modules.size();
+        }
+
+        out.info(browsedApplications.size() + " applet(s) and security domain(s): "
+                 + selectable + " SELECTABLE, " + lockedOrInstalled + " not selectable");
+        out.info(browsedLoadFiles.size() + " package(s) carrying " + modules + " module(s)");
+
+        for (int i = 0; i < browsedLoadFiles.size(); i++)
+        {
+            MslCore.Registry loadFile = (MslCore.Registry) browsedLoadFiles.get(i);
+            out.info("");
+            out.info("package " + MslCore.hex(loadFile.aid)
+                     + (loadFile.lifeCycle < 0 ? ""
+                        : "  (" + MslCore.lifeCycleName(MslCore.STATUS_LOAD_FILES,
+                                                        loadFile.lifeCycle) + ")"));
+
+            for (int j = 0; j < loadFile.modules.size(); j++)
+            {
+                out.info("    module    " + MslCore.hex((byte[]) loadFile.modules.get(j)));
+            }
+            for (int j = 0; j < browsedApplications.size(); j++)
+            {
+                MslCore.Registry application = (MslCore.Registry) browsedApplications.get(j);
+                if (startsWith(application.aid, loadFile.aid))
+                {
+                    out.info("    instance  " + MslCore.hex(application.aid) + "  "
+                             + (application.lifeCycle < 0 ? ""
+                                : MslCore.lifeCycleName(MslCore.STATUS_APPLICATIONS,
+                                                        application.lifeCycle)));
+                }
+            }
+        }
+
+        if (!browsedLoadFiles.isEmpty() && !browsedApplications.isEmpty())
+        {
+            out.info("");
+            out.info("Instances are matched to packages by AID prefix, which is a convention and "
+                     + "not a rule - a card may hold an instance whose AID says nothing about "
+                     + "where it came from. The module AID under each package is the one an "
+                     + "INSTALL needs.");
+        }
+
+        out.info("");
+        out.info("No MSL appears above, and none can: GET STATUS returns AIDs, life cycle and "
+                 + "privileges, never install parameters. Run discover against an applet's TAR "
+                 + "to measure what it enforces.");
+    }
+
+    private static boolean startsWith(byte[] value, byte[] prefix)
+    {
+        if (value == null || prefix == null || prefix.length == 0
+            || value.length <= prefix.length)
+        {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++)
+        {
+            if (value[i] != prefix[i]) { return false; }
+        }
+        return true;
     }
 
     /** True when a GET STATUS over RAM, filtered on this AID, finds it. */

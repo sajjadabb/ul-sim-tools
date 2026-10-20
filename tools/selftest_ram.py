@@ -74,7 +74,8 @@ class SimulatedCard(object):
     """
 
     def __init__(self, applications=None, load_files=None, counter=0,
-                 por_status=0x00, drop_everything=False, omit_additional_data=False):
+                 por_status=0x00, drop_everything=False, omit_additional_data=False,
+                 pending_style=True):
         # AID -> life cycle. The registry the card reports and the delete job
         # checks against.
         self.applications = dict(applications or {})
@@ -84,6 +85,11 @@ class SimulatedCard(object):
         self.por_status = por_status
         self.drop_everything = drop_everything
         self.omit_additional_data = omit_additional_data
+        # True: hold response data behind 61 xx until a GET RESPONSE asks for
+        # it, the way the live card does. False: hand it over with the command's
+        # own status word, which other cards do and the tool must also handle.
+        self.pending_style = pending_style
+        self._pending_response = None
 
         self.envelopes = 0
         self.commands = []            # every APDU the card executed, in order
@@ -204,6 +210,15 @@ class SimulatedCard(object):
         status, response = 0x6F00, b""
 
         while pos < len(data):
+            # GET RESPONSE is case 2: its fifth byte is Le, and the APDU ends
+            # there. A card knows this about 00 C0; a parser that treated P3 as
+            # Lc would read the next command's bytes as its data.
+            if pos + 5 <= len(data) and data[pos] == 0x00 and data[pos + 1] == 0xC0:
+                status, response = self._execute(bytes(data[pos:pos + 5]))
+                executed += 1
+                pos += 5
+                continue
+
             if pos + 5 > len(data) or pos + 5 + data[pos + 4] > len(data):
                 # A fragment that is not a whole APDU is still a command the
                 # card tried to execute, and it is the LAST one - which is why
@@ -254,8 +269,19 @@ class SimulatedCard(object):
         self.commands.append(apdu)
         data = bytearray(apdu)
 
+        if data[:2] == bytearray([0x00, 0xC0]):
+            return self._get_response(data)
         if data[:2] == bytearray([0x80, 0xF2]):
-            return self._get_status(data)
+            status, response = self._get_status(data)
+            if not self.pending_style or not response:
+                return status, response
+
+            # T=0 inside the script, which is what the real card does: the
+            # command answers "xx bytes are waiting" and hands over nothing
+            # until a GET RESPONSE asks. Confirmed live - GET STATUS answered
+            # 6159 with 89 bytes of registry behind it.
+            self._pending_response = (response, status)
+            return 0x6100 | (len(response) & 0xFF), b""
         if data[:2] == bytearray([0x80, 0xE4]):
             return self._delete(data)
         if data[:4] == bytearray([0x80, 0xE6, 0x02, 0x00]):
@@ -284,6 +310,21 @@ class SimulatedCard(object):
             isd = m.unhex("A000000151000000")
             out += bytearray([len(isd)]) + bytearray(isd) + bytearray([0x0F, 0x9E])
         return bytes(out)
+
+    def _get_response(self, data):
+        """00 C0 00 00 Le - hands over what the last command left waiting."""
+        if not self._pending_response:
+            return 0x6F00, b""
+
+        chunk, final = self._pending_response
+        requested = data[4]
+        if requested != len(chunk):
+            # T=0's "wrong length, ask for this many" - a card that answers
+            # this instead of truncating is why the reader retries once.
+            return 0x6C00 | (len(chunk) & 0xFF), b""
+
+        self._pending_response = None
+        return final, chunk
 
     def _get_status(self, data):
         scope = data[2]
@@ -546,14 +587,26 @@ check("browse names the life cycle rather than only the byte",
       "SELECTABLE" in out and "INSTALLED" in out, out)
 check("browse lists the package", hexs(ELF) in out, out)
 check("browse lists the module inside the package",
-      "module %s" % hexs(INSTANCE) in out, out)
+      "module  %s" % hexs(INSTANCE) in out, out)
+check("the listing is a table with a header, not a run of lines",
+      "AID" in out and "life cycle" in out and "privileges" in out, out)
+check("it ends with a summary of what the card holds",
+      "what is on this card" in out and "package(s) carrying" in out, out)
+check("the summary links the instance to the package it came from",
+      "instance  %s" % hexs(INSTANCE) in out, out)
+check("and says plainly that no MSL can come out of GET STATUS",
+      "No MSL appears above" in out, out)
 check("browse follows the card's 6310 continuation", "6310" in out, out)
 check("browse addressed the card manager TAR", card.last_tar == b"\x00\x00\x00",
       hexs(card.last_tar or b""))
 check("browse sent TERMINAL PROFILE first", card.terminal_profiles == [b"\x02"],
       str(card.terminal_profiles))
-check("every browse packet was a GET STATUS and nothing else",
-      all(bytearray(c)[:2] == bytearray([0x80, 0xF2]) for c in card.commands),
+check("browse sends nothing but GET STATUS and the GET RESPONSE that reads it",
+      all(bytearray(c)[:2] in (bytearray([0x80, 0xF2]), bytearray([0x00, 0xC0]))
+          for c in card.commands),
+      str([hexs(c)[:8] for c in card.commands]))
+check("the GET RESPONSE is paired with its command in one script, not sent alone",
+      card.commands and bytearray(card.commands[0])[:2] == bytearray([0x80, 0xF2]),
       str([hexs(c)[:8] for c in card.commands]))
 check("browse changed nothing on the card",
       card.deleted == [] and card.installed == [] and not card.load_complete)
@@ -624,6 +677,36 @@ code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "
                        "--no-packages"])
 check("--no-packages asks for one scope only", hexs(ELF) not in out, out)
 check("--no-packages still lists the applications", hexs(USIM) in out, out)
+
+# The other kind of card: one that hands the data over with the command's own
+# status word instead of holding it behind 61 xx. Both must work, and the
+# GET RESPONSE must not be sent where it is not needed.
+card = SimulatedCard(applications={bytes(USIM): 0x07}, pending_style=False)
+code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
+                       "--no-packages"])
+check("a card that answers with its data directly is listed too", code == 0, out)
+check("the instance is listed from that card", hexs(USIM) in out, out)
+check("no GET RESPONSE is sent to a card that did not ask for one",
+      not any(bytearray(c)[:2] == bytearray([0x00, 0xC0]) for c in card.commands),
+      str([hexs(c)[:8] for c in card.commands]))
+
+
+class UnderstatesLength(SimulatedCard):
+    """Answers 61 xx one byte short, so the GET RESPONSE draws a 6C yy."""
+
+    def _execute(self, apdu):
+        status, response = SimulatedCard._execute(self, apdu)
+        if (status & 0xFF00) == 0x6100:
+            return (status & 0xFF00) | ((status & 0xFF) - 1), response
+        return status, response
+
+
+card = UnderstatesLength(applications={bytes(USIM): 0x07})
+code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
+                       "--no-packages"])
+check("a 6C yy - wrong length, ask for yy - is retried once and read", code == 0, out)
+check("the listing survives the correction", hexs(USIM) in out, out)
+check("and the retry is reported rather than silent", "6C" in out, out)
 
 card = SimulatedCard(applications={bytes(USIM): 0x07}, load_files={bytes(ELF): 0x01})
 code, out = run(card, ["browse", "--tar", "000000", "--key", KEY, "--counter", "3000000",
